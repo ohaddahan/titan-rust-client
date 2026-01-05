@@ -1,10 +1,18 @@
 [package]
 name = "titan-rust-client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Rust client for Titan Exchange WebSocket API"
 license = "MIT"
 authors = ["ohaddahan@gmail.com"]
+repository = "https://github.com/ohaddahan/titan-rust-client.git"
+homepage = "https://github.com/ohaddahan/titan-rust-client"
+documentation = "https://docs.rs/titan-rust-client"
+exclude = [
+  ".github/*",
+  ".env*",
+  "examples/*.sh",
+]
 
 [lib]
 name = "titan_rust_client"
