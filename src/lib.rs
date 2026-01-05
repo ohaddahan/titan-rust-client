@@ -6,6 +6,7 @@ pub mod client;
 pub mod config;
 pub mod connection;
 pub mod error;
+pub mod instructions;
 pub mod state;
 pub mod stream;
 
@@ -13,6 +14,7 @@ pub mod stream;
 pub use client::TitanClient;
 pub use config::TitanConfig;
 pub use error::TitanClientError;
+pub use instructions::{TitanInstructions, TitanInstructionsOutput};
 pub use state::ConnectionState;
 pub use stream::QuoteStream;
 

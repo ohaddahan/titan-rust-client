@@ -45,6 +45,7 @@ tracing = "0.1"
 # Solana (for instruction types)
 solana-sdk = "2.3"
 solana-client = "2.3"
+solana-address-lookup-table-interface = "2.2.2"
 
 # CLI dependencies
 clap = { version = "4", features = ["derive", "env"], optional = true }
