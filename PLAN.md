@@ -330,9 +330,98 @@ titan-cli --url wss://... --token xxx price SOL USDC 1.0
 
 ## Testing Strategy
 
-- **Unit tests:** In-process mock WebSocket server using `tokio-tungstenite`
-- **Integration tests:** Against real Titan API (requires valid token)
-- **CLI:** Manual testing with subcommands
+### Mock WebSocket Server
+
+Create an in-process mock Titan server for local testing that mimics real API behavior:
+
+```rust
+// tests/mock_server.rs
+pub struct MockTitanServer {
+    addr: SocketAddr,
+    handle: JoinHandle<()>,
+}
+
+impl MockTitanServer {
+    /// Start a mock server on a random port
+    pub async fn start() -> Self;
+
+    /// Get the WebSocket URL to connect to
+    pub fn url(&self) -> String;
+
+    /// Configure mock responses
+    pub fn set_server_info(&self, info: ServerInfo);
+    pub fn set_venues(&self, venues: VenueInfo);
+    pub fn set_providers(&self, providers: Vec<ProviderInfo>);
+
+    /// Configure stream behavior
+    pub fn set_max_concurrent_streams(&self, max: u32);
+    pub fn emit_quote(&self, stream_id: u32, quote: SwapQuotes);
+
+    /// Simulate disconnection for reconnect testing
+    pub fn disconnect(&self);
+
+    /// Shutdown the server
+    pub async fn stop(self);
+}
+```
+
+### Test Scenarios
+
+1. **Connection Tests:**
+   - Connect to mock server
+   - Handle authentication failure (401)
+   - Test auto-reconnect on disconnect
+   - Verify exponential backoff timing
+
+2. **One-shot API Tests:**
+   - `get_info()` returns expected data
+   - `get_venues()` returns venues list
+   - `list_providers()` returns providers
+   - `get_swap_price()` with valid/invalid params
+
+3. **Streaming Tests:**
+   - Start stream, receive quotes
+   - Multiple concurrent streams
+   - Stream queue when at limit
+   - Stream cleanup on drop
+   - Stream resumption after reconnect
+
+4. **Integration Tests (requires real API):**
+   - Real connection with valid token
+   - End-to-end quote streaming
+   - Instruction preparation with RPC
+
+### Running Tests
+
+```bash
+# Unit tests with mock server
+cargo test
+
+# Integration tests (requires TITAN_TOKEN env var)
+TITAN_TOKEN=xxx cargo test --features integration
+
+# Specific test
+cargo test test_reconnect_with_backoff
+```
+
+### Test Helpers
+
+```rust
+// tests/helpers.rs
+
+/// Create a test config pointing to mock server
+pub fn test_config(mock_url: &str) -> TitanConfig;
+
+/// Wait for connection state with timeout
+pub async fn wait_for_state(
+    client: &TitanClient,
+    expected: ConnectionState,
+    timeout: Duration,
+) -> bool;
+
+/// Generate mock SwapQuotes for testing
+pub fn mock_swap_quotes(in_amount: u64, out_amount: u64) -> SwapQuotes;
+```
 
 ## Implementation Order
 

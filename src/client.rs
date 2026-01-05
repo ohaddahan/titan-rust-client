@@ -170,17 +170,42 @@ impl TitanClient {
     }
 
     /// Graceful shutdown: stops all streams, then closes WebSocket.
+    ///
+    /// This method:
+    /// 1. Sends StopStream for all active streams
+    /// 2. Clears the stream manager
+    /// 3. Closes the WebSocket connection
+    ///
+    /// After calling this, the client cannot be reused.
     #[tracing::instrument(skip_all)]
     pub async fn close(&self) -> Result<(), TitanClientError> {
+        // First, shutdown the connection (stops all streams)
+        {
+            let conn = self.connection.read().await;
+            if let Some(ref connection) = *conn {
+                connection.shutdown().await;
+            }
+        }
+
+        // Clear stream manager
         {
             let mut manager = self.stream_manager.write().await;
             *manager = None;
         }
+
+        // Clear connection (this will cause the background loop to exit)
         {
             let mut conn = self.connection.write().await;
             *conn = None;
         }
+
         Ok(())
+    }
+
+    /// Check if the client has been closed.
+    pub async fn is_closed(&self) -> bool {
+        let conn = self.connection.read().await;
+        conn.is_none()
     }
 
     // ========== One-shot API methods ==========

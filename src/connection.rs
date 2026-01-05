@@ -536,6 +536,54 @@ impl Connection {
     pub fn state(&self) -> ConnectionState {
         self.state_tx.borrow().clone()
     }
+
+    /// Get all active stream IDs.
+    pub async fn active_stream_ids(&self) -> Vec<u32> {
+        let streams = self.resumable_streams.read().await;
+        streams.keys().copied().collect()
+    }
+
+    /// Stop all active streams gracefully.
+    ///
+    /// Sends StopStream for each active stream and clears the stream map.
+    #[tracing::instrument(skip_all)]
+    pub async fn stop_all_streams(&self) {
+        use titan_api_types::ws::v1::StopStreamRequest;
+
+        let stream_ids = self.active_stream_ids().await;
+
+        if stream_ids.is_empty() {
+            return;
+        }
+
+        tracing::info!("Stopping {} active streams", stream_ids.len());
+
+        for stream_id in stream_ids {
+            // Send stop request (fire and forget)
+            let _ = self
+                .send_request(RequestData::StopStream(StopStreamRequest { id: stream_id }))
+                .await;
+        }
+
+        // Clear all streams
+        let mut streams = self.resumable_streams.write().await;
+        streams.clear();
+    }
+
+    /// Graceful shutdown: stop all streams and signal connection loop to exit.
+    #[tracing::instrument(skip_all)]
+    pub async fn shutdown(&self) {
+        // Stop all streams first
+        self.stop_all_streams().await;
+
+        // Update state
+        let _ = self.state_tx.send(ConnectionState::Disconnected {
+            reason: "Client shutdown".to_string(),
+        });
+
+        // The connection loop will exit when it detects the sender is closed
+        // (which happens when Connection is dropped)
+    }
 }
 
 /// Calculate exponential backoff.
