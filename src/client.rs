@@ -67,7 +67,9 @@ impl TitanClient {
     }
 
     /// Returns a watch receiver for connection state changes.
-    pub async fn connection_state(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
+    ///
+    /// Use this to observe state transitions (Connected, Reconnecting, Disconnected).
+    pub async fn state_receiver(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
         let conn = self.connection.read().await;
         if let Some(ref connection) = *conn {
             connection.state_receiver()
@@ -77,6 +79,56 @@ impl TitanClient {
             });
             drop(tx);
             rx
+        }
+    }
+
+    /// Get the current connection state.
+    pub async fn state(&self) -> ConnectionState {
+        let conn = self.connection.read().await;
+        if let Some(ref connection) = *conn {
+            connection.state()
+        } else {
+            ConnectionState::Disconnected {
+                reason: "Not connected".to_string(),
+            }
+        }
+    }
+
+    /// Returns true if currently connected.
+    pub async fn is_connected(&self) -> bool {
+        self.state().await.is_connected()
+    }
+
+    /// Wait until the connection is established.
+    ///
+    /// Returns immediately if already connected.
+    /// Returns error if connection is permanently closed.
+    pub async fn wait_for_connected(&self) -> Result<(), TitanClientError> {
+        let mut receiver = self.state_receiver().await;
+
+        loop {
+            let state = receiver.borrow_and_update().clone();
+            match state {
+                ConnectionState::Connected => return Ok(()),
+                ConnectionState::Disconnected { reason } => {
+                    // Check if this is a permanent disconnection
+                    if reason.contains("Max reconnect attempts") {
+                        return Err(TitanClientError::ConnectionFailed {
+                            attempts: 0,
+                            reason,
+                        });
+                    }
+                }
+                ConnectionState::Reconnecting { .. } => {}
+            }
+
+            // Wait for next state change
+            if receiver.changed().await.is_err() {
+                return Err(TitanClientError::ConnectionFailed {
+                    attempts: 0,
+                    reason: "Connection closed".to_string(),
+                });
+            }
         }
     }
 
