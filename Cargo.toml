@@ -1,20 +1,65 @@
 [package]
 name = "titan-rust-client"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "Rust client for Titan Exchange WebSocket API"
+license = "MIT"
+
+[lib]
+name = "titan_rust_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "titan-cli"
+path = "src/bin/titan_cli.rs"
 
 [dependencies]
-titan-api-codec = "1.2.1"
-titan-api-types = "2.0.0"
+# Titan API
+titan-api-codec = { version = "1.2.1", features = ["messagepack", "zstd", "brotli", "gzip"] }
+titan-api-types = { version = "2.0.0", features = [
+    "serde",
+    "pubkey-str",
+    "solana-instruction-convert-v2",
+    "solana-pubkey-convert-v2",
+    "solana-alt-account-convert-v2",
+]}
 
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
 
-[dev-dependencies.cargo-husky]
-version = "1"
-default-features = false # Disable features which are enabled by default
-features = [
-  "precommit-hook",
-  "run-cargo-test",
-  "run-cargo-clippy",
-  "run-cargo-fmt",
-  "run-for-all"
-]
+# Serialization
+rmp-serde = "1.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+
+# Solana (for instruction types)
+solana-sdk = "2.3"
+solana-client = "2.3"
+
+# CLI dependencies
+clap = { version = "4", features = ["derive", "env"], optional = true }
+dotenvy = { version = "0.15", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[features]
+default = []
+cli = ["clap", "dotenvy", "tokio-stream", "tracing-subscriber"]
+
+[dev-dependencies]
+cargo-husky = { version = "1", default-features = false, features = [
+    "precommit-hook",
+    "run-cargo-test",
+    "run-cargo-clippy",
+    "run-cargo-fmt",
+    "run-for-all",
+]}
