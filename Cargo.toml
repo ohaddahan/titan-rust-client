@@ -17,35 +17,34 @@ path = "src/bin/titan_cli.rs"
 # Titan API
 titan-api-codec = { version = "1.2.1", features = ["messagepack", "zstd", "brotli", "gzip"] }
 titan-api-types = { version = "2.0.0", features = [
-    "serde",
-    "pubkey-str",
-    "solana-instruction-convert-v2",
-    "solana-pubkey-convert-v2",
-    "solana-alt-account-convert-v2",
-]}
+  "serde",
+  "pubkey-str",
+  "solana-instruction-convert-v2",
+  "solana-pubkey-convert-v2",
+  "solana-alt-account-convert-v2",
+] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
-futures-util = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+futures-util = { version = "0.3" }
 
 # Serialization
-rmp-serde = "1.3"
+rmp-serde = { version = "1.3" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bytes = "1"
-
+serde_json = { version = "1" }
+bytes = { version = "1" }
 # Error handling
-thiserror = "2"
-anyhow = "1"
-
+thiserror = { version = "2" }
+anyhow = { version = "1" }
 # Observability
-tracing = "0.1"
-
-# Solana (for instruction types)
-solana-sdk = "2.3"
-solana-client = "2.3"
-solana-address-lookup-table-interface = "2.2.2"
+tracing = { version = "0.1" }
+solana-sdk = { version = "2.3" }
+solana-client = { version = "2.3" }
+solana-address-lookup-table-interface = { version = "2.2.2" }
 
 # CLI dependencies
 clap = { version = "4", features = ["derive", "env"], optional = true }
@@ -60,9 +59,11 @@ cli = ["clap", "dotenvy", "tokio-stream", "tracing-subscriber", "bs58"]
 
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = [
-    "precommit-hook",
-    "run-cargo-test",
-    "run-cargo-clippy",
-    "run-cargo-fmt",
-    "run-for-all",
-]}
+  "precommit-hook",
+  "run-cargo-test",
+  "run-cargo-clippy",
+  "run-cargo-fmt",
+  "run-for-all",
+] }
+tokio-test = { version = "0.4" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
