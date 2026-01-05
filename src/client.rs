@@ -4,16 +4,19 @@ use std::sync::Arc;
 
 use titan_api_types::ws::v1::{
     GetInfoRequest, GetVenuesRequest, ListProvidersRequest, ProviderInfo, RequestData,
-    ResponseData, ServerInfo, StreamDataPayload, SwapPrice, SwapPriceRequest, SwapQuoteRequest,
-    SwapQuotes, VenueInfo,
+    ResponseData, ServerInfo, SwapPrice, SwapPriceRequest, SwapQuoteRequest, VenueInfo,
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 use crate::config::TitanConfig;
 use crate::connection::Connection;
 use crate::error::TitanClientError;
+use crate::queue::StreamManager;
 use crate::state::ConnectionState;
 use crate::stream::QuoteStream;
+
+/// Default max concurrent streams if server doesn't specify.
+const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 10;
 
 /// Titan Exchange WebSocket client.
 ///
@@ -21,6 +24,7 @@ use crate::stream::QuoteStream;
 /// Can be shared across axum handlers via `Arc<TitanClient>`.
 pub struct TitanClient {
     connection: Arc<RwLock<Option<Arc<Connection>>>>,
+    stream_manager: Arc<RwLock<Option<Arc<StreamManager>>>>,
     #[allow(dead_code)]
     config: TitanConfig,
 }
@@ -28,15 +32,38 @@ pub struct TitanClient {
 impl TitanClient {
     /// Create a new client with the given configuration.
     ///
-    /// Connects eagerly but doesn't fail if unreachable - retries in background.
+    /// Connects eagerly and fetches server info to determine stream limits.
     #[tracing::instrument(skip_all)]
     pub async fn new(config: TitanConfig) -> Result<Self, TitanClientError> {
         let connection = Arc::new(Connection::connect(config.clone()).await?);
 
+        // Fetch server info to get max concurrent streams
+        let max_streams = Self::fetch_max_streams(&connection).await;
+
+        let stream_manager = StreamManager::new(connection.clone(), max_streams);
+
         Ok(Self {
             connection: Arc::new(RwLock::new(Some(connection))),
+            stream_manager: Arc::new(RwLock::new(Some(stream_manager))),
             config,
         })
+    }
+
+    /// Fetch max concurrent streams from server info.
+    async fn fetch_max_streams(connection: &Arc<Connection>) -> u32 {
+        match connection
+            .send_request(RequestData::GetInfo(GetInfoRequest { dummy: None }))
+            .await
+        {
+            Ok(response) => match response.data {
+                ResponseData::GetInfo(info) => info.settings.connection.concurrent_streams,
+                _ => DEFAULT_MAX_CONCURRENT_STREAMS,
+            },
+            Err(e) => {
+                tracing::warn!("Failed to fetch server info: {}, using default limits", e);
+                DEFAULT_MAX_CONCURRENT_STREAMS
+            }
+        }
     }
 
     /// Returns a watch receiver for connection state changes.
@@ -63,11 +90,44 @@ impl TitanClient {
             })
     }
 
+    /// Get a clone of the stream manager Arc.
+    async fn get_stream_manager(&self) -> Result<Arc<StreamManager>, TitanClientError> {
+        let manager = self.stream_manager.read().await;
+        manager
+            .clone()
+            .ok_or_else(|| TitanClientError::ConnectionFailed {
+                attempts: 0,
+                reason: "Not connected".to_string(),
+            })
+    }
+
+    /// Get the current active stream count.
+    pub async fn active_stream_count(&self) -> u32 {
+        match self.get_stream_manager().await {
+            Ok(manager) => manager.active_count(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Get the current queue length.
+    pub async fn queued_stream_count(&self) -> usize {
+        match self.get_stream_manager().await {
+            Ok(manager) => manager.queue_len().await,
+            Err(_) => 0,
+        }
+    }
+
     /// Graceful shutdown: stops all streams, then closes WebSocket.
     #[tracing::instrument(skip_all)]
     pub async fn close(&self) -> Result<(), TitanClientError> {
-        let mut conn = self.connection.write().await;
-        *conn = None;
+        {
+            let mut manager = self.stream_manager.write().await;
+            *manager = None;
+        }
+        {
+            let mut conn = self.connection.write().await;
+            *conn = None;
+        }
         Ok(())
     }
 
@@ -154,57 +214,15 @@ impl TitanClient {
     ///
     /// Returns a `QuoteStream` that yields `SwapQuotes` updates.
     /// The stream automatically sends `StopStream` when dropped.
+    ///
+    /// If the server's max concurrent streams limit is reached, the request
+    /// will be queued and started automatically when a slot becomes available.
     #[tracing::instrument(skip_all)]
     pub async fn new_swap_quote_stream(
         &self,
         request: SwapQuoteRequest,
     ) -> Result<QuoteStream, TitanClientError> {
-        let connection = self.get_connection().await?;
-
-        // Send the stream request
-        let response = connection
-            .send_request(RequestData::NewSwapQuoteStream(request))
-            .await?;
-
-        // Extract stream ID from response
-        let stream_id = response
-            .stream
-            .ok_or_else(|| {
-                TitanClientError::Unexpected(anyhow::anyhow!(
-                    "NewSwapQuoteStream response missing stream info"
-                ))
-            })?
-            .id;
-
-        // Create channels for stream data
-        // Raw StreamData channel (from connection)
-        let (raw_tx, mut raw_rx) = mpsc::channel::<titan_api_types::ws::v1::StreamData>(32);
-        // Processed SwapQuotes channel (to user)
-        let (quotes_tx, quotes_rx) = mpsc::channel::<SwapQuotes>(32);
-
-        // Register the raw stream with the connection
-        connection.register_stream(stream_id, raw_tx).await;
-
-        // Spawn adapter task to convert StreamData -> SwapQuotes
-        let adapter_connection = connection.clone();
-        tokio::spawn(async move {
-            while let Some(data) = raw_rx.recv().await {
-                match data.payload {
-                    StreamDataPayload::SwapQuotes(quotes) => {
-                        if quotes_tx.send(quotes).await.is_err() {
-                            // Receiver dropped, unregister and stop
-                            adapter_connection.unregister_stream(stream_id).await;
-                            break;
-                        }
-                    }
-                    #[allow(unreachable_patterns)]
-                    _ => {
-                        tracing::warn!("Received unexpected stream data payload type");
-                    }
-                }
-            }
-        });
-
-        Ok(QuoteStream::new(stream_id, quotes_rx, connection))
+        let manager = self.get_stream_manager().await?;
+        manager.request_stream(request).await
     }
 }

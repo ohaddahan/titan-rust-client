@@ -6,6 +6,7 @@ use titan_api_types::ws::v1::{RequestData, StopStreamRequest, SwapQuotes};
 use tokio::sync::mpsc;
 
 use crate::connection::Connection;
+use crate::queue::StreamManager;
 
 /// A handle to an active quote stream.
 ///
@@ -14,11 +15,12 @@ pub struct QuoteStream {
     stream_id: u32,
     receiver: mpsc::Receiver<SwapQuotes>,
     connection: Arc<Connection>,
+    manager: Option<Arc<StreamManager>>,
     stopped: bool,
 }
 
 impl QuoteStream {
-    /// Create a new quote stream handle.
+    /// Create a new quote stream handle (unmanaged, for backwards compatibility).
     pub fn new(
         stream_id: u32,
         receiver: mpsc::Receiver<SwapQuotes>,
@@ -28,6 +30,23 @@ impl QuoteStream {
             stream_id,
             receiver,
             connection,
+            manager: None,
+            stopped: false,
+        }
+    }
+
+    /// Create a new managed quote stream handle.
+    pub fn new_managed(
+        stream_id: u32,
+        receiver: mpsc::Receiver<SwapQuotes>,
+        connection: Arc<Connection>,
+        manager: Option<Arc<StreamManager>>,
+    ) -> Self {
+        Self {
+            stream_id,
+            receiver,
+            connection,
+            manager,
             stopped: false,
         }
     }
@@ -54,6 +73,11 @@ impl QuoteStream {
         }
         self.stopped = true;
 
+        // Notify manager that slot is freed
+        if let Some(ref manager) = self.manager {
+            manager.stream_ended();
+        }
+
         // Unregister from connection
         self.connection.unregister_stream(self.stream_id).await;
 
@@ -74,9 +98,15 @@ impl Drop for QuoteStream {
         if !self.stopped {
             let stream_id = self.stream_id;
             let connection = self.connection.clone();
+            let manager = self.manager.clone();
 
             // Spawn a task to stop the stream
             tokio::spawn(async move {
+                // Notify manager that slot is freed
+                if let Some(ref manager) = manager {
+                    manager.stream_ended();
+                }
+
                 connection.unregister_stream(stream_id).await;
                 let _ = connection
                     .send_request(RequestData::StopStream(StopStreamRequest { id: stream_id }))
