@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use titan_api_types::ws::v1::{RequestData, ResponseSuccess};
+use titan_api_types::ws::v1::{
+    GetInfoRequest, GetVenuesRequest, ListProvidersRequest, ProviderInfo, RequestData,
+    ResponseData, ResponseSuccess, ServerInfo, SwapPrice, SwapPriceRequest, VenueInfo,
+};
 use tokio::sync::RwLock;
 
 use crate::config::TitanConfig;
@@ -50,10 +53,7 @@ impl TitanClient {
 
     /// Send a request to the server and wait for response.
     #[tracing::instrument(skip_all)]
-    pub async fn send_request(
-        &self,
-        data: RequestData,
-    ) -> Result<ResponseSuccess, TitanClientError> {
+    async fn send_request(&self, data: RequestData) -> Result<ResponseSuccess, TitanClientError> {
         let conn = self.connection.read().await;
         if let Some(ref connection) = *conn {
             connection.send_request(data).await
@@ -83,5 +83,78 @@ impl TitanClient {
         let mut conn = self.connection.write().await;
         *conn = None;
         Ok(())
+    }
+
+    // ========== One-shot API methods ==========
+
+    /// Get server info and connection limits.
+    #[tracing::instrument(skip_all)]
+    pub async fn get_info(&self) -> Result<ServerInfo, TitanClientError> {
+        let response = self
+            .send_request(RequestData::GetInfo(GetInfoRequest { dummy: None }))
+            .await?;
+
+        match response.data {
+            ResponseData::GetInfo(info) => Ok(info),
+            other => Err(TitanClientError::Unexpected(anyhow::anyhow!(
+                "Unexpected response type: expected GetInfo, got {:?}",
+                std::mem::discriminant(&other)
+            ))),
+        }
+    }
+
+    /// Get available venues.
+    #[tracing::instrument(skip_all)]
+    pub async fn get_venues(&self) -> Result<VenueInfo, TitanClientError> {
+        let response = self
+            .send_request(RequestData::GetVenues(GetVenuesRequest {
+                include_program_ids: Some(true),
+            }))
+            .await?;
+
+        match response.data {
+            ResponseData::GetVenues(venues) => Ok(venues),
+            other => Err(TitanClientError::Unexpected(anyhow::anyhow!(
+                "Unexpected response type: expected GetVenues, got {:?}",
+                std::mem::discriminant(&other)
+            ))),
+        }
+    }
+
+    /// List available providers.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_providers(&self) -> Result<Vec<ProviderInfo>, TitanClientError> {
+        let response = self
+            .send_request(RequestData::ListProviders(ListProvidersRequest {
+                include_icons: Some(true),
+            }))
+            .await?;
+
+        match response.data {
+            ResponseData::ListProviders(providers) => Ok(providers),
+            other => Err(TitanClientError::Unexpected(anyhow::anyhow!(
+                "Unexpected response type: expected ListProviders, got {:?}",
+                std::mem::discriminant(&other)
+            ))),
+        }
+    }
+
+    /// Get a point-in-time swap price.
+    #[tracing::instrument(skip_all)]
+    pub async fn get_swap_price(
+        &self,
+        request: SwapPriceRequest,
+    ) -> Result<SwapPrice, TitanClientError> {
+        let response = self
+            .send_request(RequestData::GetSwapPrice(request))
+            .await?;
+
+        match response.data {
+            ResponseData::GetSwapPrice(price) => Ok(price),
+            other => Err(TitanClientError::Unexpected(anyhow::anyhow!(
+                "Unexpected response type: expected GetSwapPrice, got {:?}",
+                std::mem::discriminant(&other)
+            ))),
+        }
     }
 }
