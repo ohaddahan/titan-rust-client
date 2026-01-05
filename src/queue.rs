@@ -149,7 +149,7 @@ impl StreamManager {
     ) -> Result<QuoteStream, TitanClientError> {
         let response = self
             .connection
-            .send_request(RequestData::NewSwapQuoteStream(request))
+            .send_request(RequestData::NewSwapQuoteStream(request.clone()))
             .await
             .inspect_err(|_| {
                 // Release slot on error
@@ -172,8 +172,10 @@ impl StreamManager {
         let (raw_tx, mut raw_rx) = mpsc::channel::<titan_api_types::ws::v1::StreamData>(32);
         let (quotes_tx, quotes_rx) = mpsc::channel::<SwapQuotes>(32);
 
-        // Register the raw stream with the connection
-        self.connection.register_stream(stream_id, raw_tx).await;
+        // Register the raw stream with the connection (includes request for resumption)
+        self.connection
+            .register_stream(stream_id, request, raw_tx)
+            .await;
 
         // Spawn adapter task
         let adapter_connection = self.connection.clone();

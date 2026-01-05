@@ -1,4 +1,4 @@
-//! WebSocket connection management with auto-reconnect.
+//! WebSocket connection management with auto-reconnect and stream resumption.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -10,6 +10,7 @@ use titan_api_codec::codec::ws::v1::ClientCodec;
 use titan_api_codec::codec::Codec;
 use titan_api_types::ws::v1::{
     ClientRequest, RequestData, ResponseError, ResponseSuccess, ServerMessage, StreamData,
+    SwapQuoteRequest,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -24,10 +25,20 @@ use crate::state::ConnectionState;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ResponseResult = Result<ResponseSuccess, ResponseError>;
 type PendingRequestsMap = Arc<RwLock<HashMap<u32, oneshot::Sender<ResponseResult>>>>;
-type StreamSendersMap = Arc<RwLock<HashMap<u32, mpsc::Sender<StreamData>>>>;
 
 /// Initial backoff delay in milliseconds.
 const INITIAL_BACKOFF_MS: u64 = 100;
+
+/// Information needed to resume a stream after reconnection.
+#[derive(Clone)]
+pub struct ResumableStream {
+    /// The original request used to create the stream.
+    pub request: SwapQuoteRequest,
+    /// Channel to send stream data to.
+    pub sender: mpsc::Sender<StreamData>,
+}
+
+type ResumableStreamsMap = Arc<RwLock<HashMap<u32, ResumableStream>>>;
 
 /// Internal message for sending requests through the connection
 pub struct PendingRequest {
@@ -44,7 +55,7 @@ pub struct Connection {
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
     #[allow(dead_code)]
     pending_requests: PendingRequestsMap,
-    stream_senders: StreamSendersMap,
+    resumable_streams: ResumableStreamsMap,
 }
 
 impl Connection {
@@ -58,7 +69,7 @@ impl Connection {
         });
 
         let pending_requests: PendingRequestsMap = Arc::new(RwLock::new(HashMap::new()));
-        let stream_senders: StreamSendersMap = Arc::new(RwLock::new(HashMap::new()));
+        let resumable_streams: ResumableStreamsMap = Arc::new(RwLock::new(HashMap::new()));
 
         // Connect to WebSocket
         let ws_stream = Self::establish_connection(&config).await?;
@@ -68,7 +79,7 @@ impl Connection {
 
         // Spawn background task with reconnection support
         let pending_clone = pending_requests.clone();
-        let streams_clone = stream_senders.clone();
+        let streams_clone = resumable_streams.clone();
         let state_tx_clone = state_tx.clone();
         let config_clone = config.clone();
 
@@ -89,7 +100,7 @@ impl Connection {
             sender,
             state_tx,
             pending_requests,
-            stream_senders,
+            resumable_streams,
         })
     }
 
@@ -126,17 +137,18 @@ impl Connection {
         Ok(ws_stream)
     }
 
-    /// Connection loop with automatic reconnection.
+    /// Connection loop with automatic reconnection and stream resumption.
     async fn run_connection_loop_with_reconnect(
         initial_ws_stream: WsStream,
         mut request_rx: mpsc::Receiver<PendingRequest>,
         pending_requests: PendingRequestsMap,
-        stream_senders: StreamSendersMap,
+        resumable_streams: ResumableStreamsMap,
         state_tx: tokio::sync::watch::Sender<ConnectionState>,
         config: TitanConfig,
     ) {
         let mut ws_stream = initial_ws_stream;
         let mut reconnect_attempt: u32 = 0;
+        let mut request_id_counter: u32 = 1;
 
         loop {
             // Run the connection loop until disconnection
@@ -144,8 +156,9 @@ impl Connection {
                 &mut ws_stream,
                 &mut request_rx,
                 &pending_requests,
-                &stream_senders,
+                &resumable_streams,
                 &state_tx,
+                &mut request_id_counter,
             )
             .await;
 
@@ -193,13 +206,20 @@ impl Connection {
             match Self::establish_connection(&config).await {
                 Ok(new_stream) => {
                     ws_stream = new_stream;
-                    reconnect_attempt = 0; // Reset on successful connection
+                    reconnect_attempt = 0;
                     let _ = state_tx.send(ConnectionState::Connected);
                     tracing::info!("Reconnected successfully");
+
+                    // Resume streams after reconnection
+                    Self::resume_streams(
+                        &mut ws_stream,
+                        &resumable_streams,
+                        &mut request_id_counter,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::warn!("Reconnection failed: {}", e);
-                    // Continue loop to retry
                     continue;
                 }
             }
@@ -209,14 +229,114 @@ impl Connection {
         Self::cleanup_pending_requests(&pending_requests).await;
     }
 
+    /// Resume all active streams after reconnection.
+    async fn resume_streams(
+        ws_stream: &mut WsStream,
+        resumable_streams: &ResumableStreamsMap,
+        request_id_counter: &mut u32,
+    ) {
+        let streams_to_resume: Vec<(u32, ResumableStream)> = {
+            let streams = resumable_streams.read().await;
+            streams.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+
+        if streams_to_resume.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "Resuming {} streams after reconnection",
+            streams_to_resume.len()
+        );
+
+        let codec = ClientCodec::Uncompressed;
+        let mut encoder = codec.encoder();
+        let mut decoder = codec.decoder();
+
+        for (old_stream_id, resumable) in streams_to_resume {
+            let request_id = *request_id_counter;
+            *request_id_counter += 1;
+
+            let request = ClientRequest {
+                id: request_id,
+                data: RequestData::NewSwapQuoteStream(resumable.request.clone()),
+            };
+
+            // Encode and send the request
+            let encoded = match encoder.encode_mut(&request) {
+                Ok(data) => data.to_vec(),
+                Err(e) => {
+                    tracing::error!("Failed to encode stream resume request: {}", e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = ws_stream.send(Message::Binary(encoded.into())).await {
+                tracing::error!("Failed to send stream resume request: {}", e);
+                continue;
+            }
+
+            // Wait for response to get new stream ID
+            match ws_stream.next().await {
+                Some(Ok(Message::Binary(data))) => {
+                    match decoder.decode_mut(data) {
+                        Ok(ServerMessage::Response(response)) => {
+                            if let Some(stream_info) = response.stream {
+                                let new_stream_id = stream_info.id;
+
+                                // Update the stream mapping
+                                let mut streams = resumable_streams.write().await;
+                                if let Some(stream) = streams.remove(&old_stream_id) {
+                                    streams.insert(new_stream_id, stream);
+                                    tracing::info!(
+                                        old_id = old_stream_id,
+                                        new_id = new_stream_id,
+                                        "Stream resumed with new ID"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(ServerMessage::Error(error)) => {
+                            tracing::error!(
+                                "Failed to resume stream {}: {}",
+                                old_stream_id,
+                                error.message
+                            );
+                            // Remove the failed stream
+                            let mut streams = resumable_streams.write().await;
+                            streams.remove(&old_stream_id);
+                        }
+                        Ok(_) => {
+                            tracing::warn!("Unexpected response type during stream resumption");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to decode stream resume response: {}", e);
+                        }
+                    }
+                }
+                Some(Ok(_)) => {
+                    tracing::warn!("Unexpected message type during stream resumption");
+                }
+                Some(Err(e)) => {
+                    tracing::error!("WebSocket error during stream resumption: {}", e);
+                    break;
+                }
+                None => {
+                    tracing::error!("Connection closed during stream resumption");
+                    break;
+                }
+            }
+        }
+    }
+
     /// Run a single connection until disconnection.
-    /// Returns the reason for disconnection.
     async fn run_single_connection(
         ws_stream: &mut WsStream,
         request_rx: &mut mpsc::Receiver<PendingRequest>,
         pending_requests: &PendingRequestsMap,
-        stream_senders: &StreamSendersMap,
+        resumable_streams: &ResumableStreamsMap,
         state_tx: &tokio::sync::watch::Sender<ConnectionState>,
+        request_id_counter: &mut u32,
     ) -> String {
         let codec = ClientCodec::Uncompressed;
         let mut encoder = codec.encoder();
@@ -226,17 +346,15 @@ impl Connection {
 
         loop {
             tokio::select! {
-                // Handle outgoing requests
                 Some(pending_req) = request_rx.recv() => {
                     let request_id = pending_req.request.id;
+                    *request_id_counter = request_id.max(*request_id_counter) + 1;
 
-                    // Store the response channel
                     {
                         let mut pending_map = pending_requests.write().await;
                         pending_map.insert(request_id, pending_req.response_tx);
                     }
 
-                    // Encode and send
                     match encoder.encode_mut(&pending_req.request) {
                         Ok(data) => {
                             if let Err(e) = ws_sink.send(Message::Binary(data.to_vec().into())).await {
@@ -265,7 +383,6 @@ impl Connection {
                     }
                 }
 
-                // Handle incoming messages
                 Some(msg_result) = ws_stream_rx.next() => {
                     match msg_result {
                         Ok(Message::Binary(data)) => {
@@ -274,7 +391,7 @@ impl Connection {
                                     Self::handle_server_message(
                                         server_msg,
                                         pending_requests,
-                                        stream_senders,
+                                        resumable_streams,
                                     ).await;
                                 }
                                 Err(e) => {
@@ -295,9 +412,7 @@ impl Connection {
                         Ok(Message::Ping(data)) => {
                             let _ = ws_sink.send(Message::Pong(data)).await;
                         }
-                        Ok(_) => {
-                            // Ignore text and other message types
-                        }
+                        Ok(_) => {}
                         Err(e) => {
                             let reason = format!("WebSocket error: {}", e);
                             tracing::error!("{}", reason);
@@ -320,7 +435,7 @@ impl Connection {
     async fn handle_server_message(
         msg: ServerMessage,
         pending_requests: &PendingRequestsMap,
-        stream_senders: &StreamSendersMap,
+        resumable_streams: &ResumableStreamsMap,
     ) {
         match msg {
             ServerMessage::Response(response) => {
@@ -336,14 +451,14 @@ impl Connection {
                 }
             }
             ServerMessage::StreamData(data) => {
-                let senders = stream_senders.read().await;
-                if let Some(tx) = senders.get(&data.id) {
-                    let _ = tx.send(data).await;
+                let streams = resumable_streams.read().await;
+                if let Some(stream) = streams.get(&data.id) {
+                    let _ = stream.sender.send(data).await;
                 }
             }
             ServerMessage::StreamEnd(end) => {
-                let mut senders = stream_senders.write().await;
-                senders.remove(&end.id);
+                let mut streams = resumable_streams.write().await;
+                streams.remove(&end.id);
             }
             ServerMessage::Other(_) => {
                 tracing::warn!("Received unknown server message type");
@@ -395,16 +510,21 @@ impl Connection {
         })
     }
 
-    /// Register a stream sender for receiving stream data.
-    pub async fn register_stream(&self, stream_id: u32, sender: mpsc::Sender<StreamData>) {
-        let mut senders = self.stream_senders.write().await;
-        senders.insert(stream_id, sender);
+    /// Register a resumable stream.
+    pub async fn register_stream(
+        &self,
+        stream_id: u32,
+        request: SwapQuoteRequest,
+        sender: mpsc::Sender<StreamData>,
+    ) {
+        let mut streams = self.resumable_streams.write().await;
+        streams.insert(stream_id, ResumableStream { request, sender });
     }
 
     /// Unregister a stream.
     pub async fn unregister_stream(&self, stream_id: u32) {
-        let mut senders = self.stream_senders.write().await;
-        senders.remove(&stream_id);
+        let mut streams = self.resumable_streams.write().await;
+        streams.remove(&stream_id);
     }
 
     /// Get a receiver for connection state changes.
@@ -418,7 +538,7 @@ impl Connection {
     }
 }
 
-/// Calculate exponential backoff with jitter.
+/// Calculate exponential backoff.
 fn calculate_backoff(attempt: u32, max_delay_ms: u64) -> u64 {
     let base_delay = INITIAL_BACKOFF_MS * 2u64.saturating_pow(attempt.saturating_sub(1));
     base_delay.min(max_delay_ms)
