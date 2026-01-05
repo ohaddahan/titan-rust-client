@@ -5496,6 +5496,7 @@ name = "titan-rust-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "bytes",
  "cargo-husky",
  "clap",
