@@ -4,21 +4,23 @@ use std::sync::Arc;
 
 use titan_api_types::ws::v1::{
     GetInfoRequest, GetVenuesRequest, ListProvidersRequest, ProviderInfo, RequestData,
-    ResponseData, ResponseSuccess, ServerInfo, SwapPrice, SwapPriceRequest, VenueInfo,
+    ResponseData, ServerInfo, StreamDataPayload, SwapPrice, SwapPriceRequest, SwapQuoteRequest,
+    SwapQuotes, VenueInfo,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::config::TitanConfig;
 use crate::connection::Connection;
 use crate::error::TitanClientError;
 use crate::state::ConnectionState;
+use crate::stream::QuoteStream;
 
 /// Titan Exchange WebSocket client.
 ///
 /// Thread-safe client for interacting with the Titan Exchange API.
 /// Can be shared across axum handlers via `Arc<TitanClient>`.
 pub struct TitanClient {
-    connection: Arc<RwLock<Option<Connection>>>,
+    connection: Arc<RwLock<Option<Arc<Connection>>>>,
     #[allow(dead_code)]
     config: TitanConfig,
 }
@@ -29,7 +31,7 @@ impl TitanClient {
     /// Connects eagerly but doesn't fail if unreachable - retries in background.
     #[tracing::instrument(skip_all)]
     pub async fn new(config: TitanConfig) -> Result<Self, TitanClientError> {
-        let connection = Connection::connect(config.clone()).await?;
+        let connection = Arc::new(Connection::connect(config.clone()).await?);
 
         Ok(Self {
             connection: Arc::new(RwLock::new(Some(connection))),
@@ -51,30 +53,14 @@ impl TitanClient {
         }
     }
 
-    /// Send a request to the server and wait for response.
-    #[tracing::instrument(skip_all)]
-    async fn send_request(&self, data: RequestData) -> Result<ResponseSuccess, TitanClientError> {
+    /// Get a clone of the connection Arc.
+    async fn get_connection(&self) -> Result<Arc<Connection>, TitanClientError> {
         let conn = self.connection.read().await;
-        if let Some(ref connection) = *conn {
-            connection.send_request(data).await
-        } else {
-            Err(TitanClientError::ConnectionFailed {
+        conn.clone()
+            .ok_or_else(|| TitanClientError::ConnectionFailed {
                 attempts: 0,
                 reason: "Not connected".to_string(),
             })
-        }
-    }
-
-    /// Get a reference to the underlying connection for stream registration.
-    pub async fn connection(&self) -> Option<impl std::ops::Deref<Target = Connection> + '_> {
-        let guard = self.connection.read().await;
-        if guard.is_some() {
-            Some(tokio::sync::RwLockReadGuard::map(guard, |opt| {
-                opt.as_ref().unwrap()
-            }))
-        } else {
-            None
-        }
     }
 
     /// Graceful shutdown: stops all streams, then closes WebSocket.
@@ -90,7 +76,8 @@ impl TitanClient {
     /// Get server info and connection limits.
     #[tracing::instrument(skip_all)]
     pub async fn get_info(&self) -> Result<ServerInfo, TitanClientError> {
-        let response = self
+        let connection = self.get_connection().await?;
+        let response = connection
             .send_request(RequestData::GetInfo(GetInfoRequest { dummy: None }))
             .await?;
 
@@ -106,7 +93,8 @@ impl TitanClient {
     /// Get available venues.
     #[tracing::instrument(skip_all)]
     pub async fn get_venues(&self) -> Result<VenueInfo, TitanClientError> {
-        let response = self
+        let connection = self.get_connection().await?;
+        let response = connection
             .send_request(RequestData::GetVenues(GetVenuesRequest {
                 include_program_ids: Some(true),
             }))
@@ -124,7 +112,8 @@ impl TitanClient {
     /// List available providers.
     #[tracing::instrument(skip_all)]
     pub async fn list_providers(&self) -> Result<Vec<ProviderInfo>, TitanClientError> {
-        let response = self
+        let connection = self.get_connection().await?;
+        let response = connection
             .send_request(RequestData::ListProviders(ListProvidersRequest {
                 include_icons: Some(true),
             }))
@@ -145,7 +134,8 @@ impl TitanClient {
         &self,
         request: SwapPriceRequest,
     ) -> Result<SwapPrice, TitanClientError> {
-        let response = self
+        let connection = self.get_connection().await?;
+        let response = connection
             .send_request(RequestData::GetSwapPrice(request))
             .await?;
 
@@ -156,5 +146,65 @@ impl TitanClient {
                 std::mem::discriminant(&other)
             ))),
         }
+    }
+
+    // ========== Streaming API methods ==========
+
+    /// Start a new swap quote stream.
+    ///
+    /// Returns a `QuoteStream` that yields `SwapQuotes` updates.
+    /// The stream automatically sends `StopStream` when dropped.
+    #[tracing::instrument(skip_all)]
+    pub async fn new_swap_quote_stream(
+        &self,
+        request: SwapQuoteRequest,
+    ) -> Result<QuoteStream, TitanClientError> {
+        let connection = self.get_connection().await?;
+
+        // Send the stream request
+        let response = connection
+            .send_request(RequestData::NewSwapQuoteStream(request))
+            .await?;
+
+        // Extract stream ID from response
+        let stream_id = response
+            .stream
+            .ok_or_else(|| {
+                TitanClientError::Unexpected(anyhow::anyhow!(
+                    "NewSwapQuoteStream response missing stream info"
+                ))
+            })?
+            .id;
+
+        // Create channels for stream data
+        // Raw StreamData channel (from connection)
+        let (raw_tx, mut raw_rx) = mpsc::channel::<titan_api_types::ws::v1::StreamData>(32);
+        // Processed SwapQuotes channel (to user)
+        let (quotes_tx, quotes_rx) = mpsc::channel::<SwapQuotes>(32);
+
+        // Register the raw stream with the connection
+        connection.register_stream(stream_id, raw_tx).await;
+
+        // Spawn adapter task to convert StreamData -> SwapQuotes
+        let adapter_connection = connection.clone();
+        tokio::spawn(async move {
+            while let Some(data) = raw_rx.recv().await {
+                match data.payload {
+                    StreamDataPayload::SwapQuotes(quotes) => {
+                        if quotes_tx.send(quotes).await.is_err() {
+                            // Receiver dropped, unregister and stop
+                            adapter_connection.unregister_stream(stream_id).await;
+                            break;
+                        }
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {
+                        tracing::warn!("Received unexpected stream data payload type");
+                    }
+                }
+            }
+        });
+
+        Ok(QuoteStream::new(stream_id, quotes_rx, connection))
     }
 }
