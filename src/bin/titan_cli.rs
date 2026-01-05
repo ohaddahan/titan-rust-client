@@ -27,13 +27,21 @@ mod cli {
         #[arg(
             long,
             env = "TITAN_URL",
-            default_value = "wss://api.titan.ag/api/v1/ws"
+            default_value = "wss://us1.api.demo.titan.exchange/api/v1/ws"
         )]
         url: String,
 
         /// Authentication token
         #[arg(long, env = "TITAN_TOKEN")]
         token: String,
+
+        /// Solana RPC URL (for swap command)
+        #[arg(
+            long,
+            env = "SOLANA_RPC_URL",
+            default_value = "https://api.mainnet-beta.solana.com"
+        )]
+        rpc_url: String,
 
         #[command(subcommand)]
         command: Commands,
@@ -84,11 +92,42 @@ mod cli {
             user: Option<String>,
         },
 
+        /// Execute a swap transaction
+        Swap {
+            /// Path to keypair JSON file
+            #[arg(long, env = "KEYPAIR_PATH")]
+            keypair: String,
+
+            /// Input token mint (e.g., SOL, USDC, or mint address)
+            #[arg(default_value = "So11111111111111111111111111111111111111112")]
+            input_mint: String,
+
+            /// Output token mint (e.g., SOL, USDC, or mint address)
+            #[arg(default_value = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")]
+            output_mint: String,
+
+            /// Amount in base units (lamports for SOL)
+            #[arg(default_value = "1000000000")]
+            amount: u64,
+
+            /// Slippage tolerance in basis points (e.g., 50 = 0.5%)
+            #[arg(long, default_value = "50")]
+            slippage_bps: u16,
+
+            /// Skip confirmation prompt
+            #[arg(long)]
+            yes: bool,
+        },
+
         /// Watch connection state changes
         Watch,
     }
 
     pub fn run() {
+        // Install the ring crypto provider (required for rustls 0.23+)
+        // Must be done before any TLS operations
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         // Load .env file if present
         let _ = dotenvy::dotenv();
 
@@ -137,6 +176,26 @@ mod cli {
                 amount,
                 user,
             } => cmd_stream(&client, &input_mint, &output_mint, amount, user).await,
+            Commands::Swap {
+                keypair,
+                input_mint,
+                output_mint,
+                amount,
+                slippage_bps,
+                yes,
+            } => {
+                cmd_swap(
+                    &client,
+                    &cli.rpc_url,
+                    &keypair,
+                    &input_mint,
+                    &output_mint,
+                    amount,
+                    slippage_bps,
+                    yes,
+                )
+                .await
+            }
             Commands::Watch => cmd_watch(&client).await,
         };
 
@@ -316,6 +375,181 @@ mod cli {
 
         println!("Received {} quotes total", count);
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn cmd_swap(
+        client: &TitanClient,
+        rpc_url: &str,
+        keypair_path: &str,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        slippage_bps: u16,
+        skip_confirm: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use solana_client::nonblocking::rpc_client::RpcClient;
+        use solana_sdk::{
+            commitment_config::CommitmentConfig,
+            compute_budget::ComputeBudgetInstruction,
+            message::{v0::Message as V0Message, VersionedMessage},
+            signer::Signer,
+            transaction::VersionedTransaction,
+        };
+        use titan_rust_client::types::{SwapMode, SwapParams, SwapQuoteRequest, TransactionParams};
+        use titan_rust_client::TitanInstructions;
+
+        // Load keypair
+        let keypair = load_keypair(keypair_path)?;
+        let user_pubkey = keypair.pubkey();
+        println!("Loaded keypair: {}", user_pubkey);
+
+        // Parse mints
+        let input = parse_mint(input_mint)?;
+        let output = parse_mint(output_mint)?;
+
+        // Create RPC client
+        let rpc_client =
+            RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
+
+        // Create quote request with our pubkey
+        let request = SwapQuoteRequest {
+            swap: SwapParams {
+                input_mint: input,
+                output_mint: output,
+                amount,
+                swap_mode: Some(SwapMode::ExactIn),
+                slippage_bps: Some(slippage_bps),
+                ..Default::default()
+            },
+            transaction: TransactionParams {
+                user_public_key: titan_rust_client::types::Pubkey::from(user_pubkey.to_bytes()),
+                ..Default::default()
+            },
+            update: None,
+        };
+
+        println!(
+            "Getting quote for {} {} -> {}...",
+            amount, input_mint, output_mint
+        );
+
+        // Start quote stream and get first quote
+        let mut stream = client.new_swap_quote_stream(request).await?;
+        let quotes = match stream.recv().await {
+            Some(q) => q,
+            None => return Err("No quotes received".into()),
+        };
+
+        // Stop the stream - we only need one quote
+        stream.stop().await?;
+
+        // Find the best route (highest output amount)
+        let (provider_id, best_route) = quotes
+            .quotes
+            .iter()
+            .max_by_key(|(_, route)| route.out_amount)
+            .ok_or("No routes in quote")?;
+
+        println!("\nBest quote from {}:", provider_id);
+        println!("  In:  {} ({})", best_route.in_amount, input_mint);
+        println!("  Out: {} ({})", best_route.out_amount, output_mint);
+        println!("  Slippage: {} bps", best_route.slippage_bps);
+        if !best_route.steps.is_empty() {
+            print!("  Path: ");
+            for (i, step) in best_route.steps.iter().enumerate() {
+                if i > 0 {
+                    print!(" -> ");
+                }
+                print!("{}", step.label);
+            }
+            println!();
+        }
+
+        // Check if instructions are available
+        if best_route.instructions.is_empty() {
+            return Err("No instructions in route - cannot execute swap".into());
+        }
+
+        // Confirmation prompt
+        if !skip_confirm {
+            println!("\nProceed with swap? [y/N]");
+            let mut input_line = String::new();
+            std::io::stdin().read_line(&mut input_line)?;
+            if !input_line.trim().eq_ignore_ascii_case("y") {
+                println!("Swap cancelled");
+                return Ok(());
+            }
+        }
+
+        println!("\nPreparing transaction...");
+
+        // Prepare instructions (fetch ALTs from chain)
+        let prepared = TitanInstructions::prepare_instructions(best_route, &rpc_client).await?;
+
+        // Build transaction with compute budget
+        let mut instructions = Vec::new();
+
+        // Add compute budget instructions
+        if let Some(units) = prepared.compute_units_safe.or(prepared.compute_units) {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                units as u32,
+            ));
+        }
+
+        // Add swap instructions
+        instructions.extend(prepared.instructions);
+
+        // Get recent blockhash
+        let blockhash = rpc_client.get_latest_blockhash().await?;
+
+        // Build versioned message with ALTs
+        let message = if prepared.address_lookup_table_accounts.is_empty() {
+            // Legacy message if no ALTs
+            VersionedMessage::Legacy(solana_sdk::message::Message::new_with_blockhash(
+                &instructions,
+                Some(&user_pubkey),
+                &blockhash,
+            ))
+        } else {
+            // V0 message with ALTs
+            let v0_message = V0Message::try_compile(
+                &user_pubkey,
+                &instructions,
+                &prepared.address_lookup_table_accounts,
+                blockhash,
+            )?;
+            VersionedMessage::V0(v0_message)
+        };
+
+        // Sign transaction
+        let transaction = VersionedTransaction::try_new(message, &[&keypair])?;
+
+        println!("Sending transaction...");
+
+        // Send and confirm
+        let signature = rpc_client
+            .send_and_confirm_transaction(&transaction)
+            .await?;
+
+        println!("\nSwap executed successfully!");
+        println!("Signature: {}", signature);
+        println!("Explorer: https://solscan.io/tx/{}", signature);
+
+        Ok(())
+    }
+
+    /// Load a Solana keypair from a JSON file.
+    fn load_keypair(
+        path: &str,
+    ) -> Result<solana_sdk::signer::keypair::Keypair, Box<dyn std::error::Error>> {
+        use solana_sdk::signer::keypair::Keypair;
+        use std::fs;
+
+        let data = fs::read_to_string(path)?;
+        let bytes: Vec<u8> = serde_json::from_str(&data)?;
+        let keypair = Keypair::try_from(bytes.as_slice())?;
+        Ok(keypair)
     }
 
     async fn cmd_watch(client: &TitanClient) -> Result<(), Box<dyn std::error::Error>> {

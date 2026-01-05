@@ -14,7 +14,6 @@ use titan_api_types::ws::v1::{
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio_tungstenite::tungstenite::http::Uri;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -106,30 +105,31 @@ impl Connection {
 
     /// Establish WebSocket connection with authentication.
     async fn establish_connection(config: &TitanConfig) -> Result<WsStream, TitanClientError> {
-        let url = format!("{}?auth={}", config.url, config.token);
-        let uri: Uri = url
-            .parse()
-            .map_err(|e| TitanClientError::Unexpected(anyhow::anyhow!("Invalid URL: {}", e)))?;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-        let request = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri(uri)
-            .header(
-                "Sec-WebSocket-Protocol",
-                titan_api_types::ws::v1::WEBSOCKET_SUBPROTO_BASE,
-            )
-            .header("Host", extract_host(&config.url).unwrap_or("api.titan.ag"))
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header(
-                "Sec-WebSocket-Key",
-                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .map_err(|e| {
-                TitanClientError::Unexpected(anyhow::anyhow!("Failed to build request: {}", e))
-            })?;
+        // Build URL with auth token as query param
+        // Only add trailing slash if URL has no path (e.g., ws://host:port -> ws://host:port/)
+        let url = if config.url.contains("/ws") || config.url.ends_with('/') {
+            // URL already has a path, just append query param
+            format!("{}?auth={}", config.url, config.token)
+        } else {
+            // URL has no path, add trailing slash first
+            format!("{}/?auth={}", config.url, config.token)
+        };
 
+        let mut request = url.into_client_request().map_err(|e| {
+            TitanClientError::Unexpected(anyhow::anyhow!("Failed to build request: {}", e))
+        })?;
+
+        // Add the Titan subprotocol header
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            titan_api_types::ws::v1::WEBSOCKET_SUBPROTO_BASE
+                .parse()
+                .unwrap(),
+        );
+
+        // connect_async handles TLS automatically when rustls-tls-native-roots is enabled
         let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(TitanClientError::WebSocket)?;
@@ -590,12 +590,4 @@ impl Connection {
 fn calculate_backoff(attempt: u32, max_delay_ms: u64) -> u64 {
     let base_delay = INITIAL_BACKOFF_MS * 2u64.saturating_pow(attempt.saturating_sub(1));
     base_delay.min(max_delay_ms)
-}
-
-/// Extract host from URL for the Host header.
-fn extract_host(url: &str) -> Option<&str> {
-    url.strip_prefix("wss://")
-        .or_else(|| url.strip_prefix("ws://"))
-        .and_then(|s| s.split('/').next())
-        .and_then(|s| s.split('?').next())
 }
