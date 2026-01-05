@@ -14,6 +14,7 @@ pub use client::TitanClient;
 pub use config::TitanConfig;
 pub use error::TitanClientError;
 pub use state::ConnectionState;
+pub use stream::QuoteStream;
 
 // Re-export titan-api-types for convenience
 pub mod types {
