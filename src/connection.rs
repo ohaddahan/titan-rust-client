@@ -415,7 +415,12 @@ impl Connection {
                         Ok(_) => {}
                         Err(e) => {
                             let reason = format!("WebSocket error: {}", e);
-                            tracing::error!("{}", reason);
+                            let error_str = e.to_string();
+                            if error_str.contains("Connection reset without closing handshake") {
+                                tracing::info!("{}", reason);
+                            } else {
+                                tracing::error!("{}", reason);
+                            }
                             let _ = state_tx.send(ConnectionState::Disconnected {
                                 reason: reason.clone(),
                             });

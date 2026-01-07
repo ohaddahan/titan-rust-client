@@ -1,4 +1,6 @@
 //! Instruction helpers for building Solana transactions from Titan swap routes.
+//!
+//! This module is only available when the `solana` feature is enabled.
 
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::nonblocking::rpc_client::RpcClient;
