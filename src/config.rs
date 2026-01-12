@@ -16,6 +16,9 @@ pub struct TitanConfig {
 
     /// Whether to wrap/unwrap SOL automatically (default: false)
     pub auto_wrap_sol: bool,
+
+    /// Skip TLS certificate verification (default: false)
+    pub danger_accept_invalid_certs: bool,
 }
 
 impl TitanConfig {
@@ -26,6 +29,7 @@ impl TitanConfig {
             max_reconnect_delay_ms: 30_000,
             max_reconnect_attempts: None,
             auto_wrap_sol: false,
+            danger_accept_invalid_certs: false,
         }
     }
 
@@ -43,6 +47,11 @@ impl TitanConfig {
         self.auto_wrap_sol = enabled;
         self
     }
+
+    pub fn with_danger_accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.danger_accept_invalid_certs = accept;
+        self
+    }
 }
 
 impl Default for TitanConfig {
@@ -53,6 +62,7 @@ impl Default for TitanConfig {
             max_reconnect_delay_ms: 30_000,
             max_reconnect_attempts: None,
             auto_wrap_sol: false,
+            danger_accept_invalid_certs: false,
         }
     }
 }

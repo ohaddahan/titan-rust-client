@@ -16,6 +16,7 @@ pub fn test_config(url: &str) -> TitanConfig {
         max_reconnect_delay_ms: 1000,
         max_reconnect_attempts: Some(3),
         auto_wrap_sol: false,
+        danger_accept_invalid_certs: false,
     }
 }
 

@@ -11,6 +11,7 @@ pub mod instructions;
 pub mod queue;
 pub mod state;
 pub mod stream;
+pub mod tls;
 
 // Re-export main types
 pub use client::TitanClient;

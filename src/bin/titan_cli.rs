@@ -16,8 +16,9 @@ fn main() {
 #[cfg(feature = "cli")]
 mod cli {
     use clap::{Parser, Subcommand};
+    use titan_rust_client::types::{SwapParams, SwapQuoteRequest, TransactionParams};
+    use titan_rust_client::TitanInstructions;
     use titan_rust_client::{TitanClient, TitanConfig};
-
     /// Titan Exchange CLI client for testing and debugging.
     #[derive(Parser)]
     #[command(name = "titan-cli")]
@@ -42,6 +43,10 @@ mod cli {
             default_value = "https://api.mainnet-beta.solana.com"
         )]
         rpc_url: String,
+
+        /// Accept invalid TLS certificates (for development only)
+        #[arg(long, env = "TITAN_DANGER_ACCEPT_INVALID_CERTS")]
+        danger_accept_invalid_certs: bool,
 
         #[command(subcommand)]
         command: Commands,
@@ -147,7 +152,8 @@ mod cli {
     }
 
     async fn run_command(cli: Cli) {
-        let config = TitanConfig::new(&cli.url, &cli.token);
+        let config = TitanConfig::new(&cli.url, &cli.token)
+            .with_danger_accept_invalid_certs(cli.danger_accept_invalid_certs);
 
         println!("Connecting to {}...", cli.url);
 
@@ -396,8 +402,6 @@ mod cli {
             signer::Signer,
             transaction::VersionedTransaction,
         };
-        use titan_rust_client::types::{SwapMode, SwapParams, SwapQuoteRequest, TransactionParams};
-        use titan_rust_client::TitanInstructions;
 
         // Load keypair
         let keypair = load_keypair(keypair_path)?;
@@ -418,13 +422,26 @@ mod cli {
                 input_mint: input,
                 output_mint: output,
                 amount,
-                swap_mode: Some(SwapMode::ExactIn),
+                swap_mode: None,
+                only_direct_routes: Some(true),
                 slippage_bps: Some(slippage_bps),
-                ..Default::default()
+                dexes: None,
+                exclude_dexes: None,
+                add_size_constraint: None,
+                size_constraint: None,
+                providers: None,
+                accounts_limit_total: None,
+                accounts_limit_writable: None,
+                transaction_template: None,
             },
             transaction: TransactionParams {
                 user_public_key: titan_rust_client::types::Pubkey::from(user_pubkey.to_bytes()),
-                ..Default::default()
+                close_input_token_account: None,
+                create_output_token_account: None,
+                fee_account: None,
+                fee_bps: None,
+                fee_from_input_mint: None,
+                output_account: None,
             },
             update: None,
         };

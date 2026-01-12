@@ -106,6 +106,7 @@ impl Connection {
     /// Establish WebSocket connection with authentication.
     async fn establish_connection(config: &TitanConfig) -> Result<WsStream, TitanClientError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::Connector;
 
         // Build URL with auth token as query param
         // Only add trailing slash if URL has no path (e.g., ws://host:port -> ws://host:port/)
@@ -129,10 +130,17 @@ impl Connection {
                 .unwrap(),
         );
 
-        // connect_async handles TLS automatically when rustls-tls-native-roots is enabled
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(TitanClientError::WebSocket)?;
+        let (ws_stream, _response) = if config.danger_accept_invalid_certs {
+            let tls_config = crate::tls::build_dangerous_tls_config();
+            let connector = Connector::Rustls(Arc::new(tls_config));
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+                .await
+                .map_err(TitanClientError::WebSocket)?
+        } else {
+            tokio_tungstenite::connect_async(request)
+                .await
+                .map_err(TitanClientError::WebSocket)?
+        };
 
         Ok(ws_stream)
     }
