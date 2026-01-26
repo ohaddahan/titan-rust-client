@@ -5455,7 +5455,7 @@ dependencies = [
 
 [[package]]
 name = "titan-rust-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "bs58",

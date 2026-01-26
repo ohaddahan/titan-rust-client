@@ -26,7 +26,10 @@ type ResponseResult = Result<ResponseSuccess, ResponseError>;
 type PendingRequestsMap = Arc<RwLock<HashMap<u32, oneshot::Sender<ResponseResult>>>>;
 
 /// Initial backoff delay in milliseconds.
-const INITIAL_BACKOFF_MS: u64 = 100;
+pub const INITIAL_BACKOFF_MS: u64 = 100;
+
+/// Default ping interval in milliseconds (used if config value is 0).
+pub const DEFAULT_PING_INTERVAL_MS: u64 = 25_000;
 
 /// Information needed to resume a stream after reconnection.
 #[derive(Clone)]
@@ -158,6 +161,8 @@ impl Connection {
         let mut reconnect_attempt: u32 = 0;
         let mut request_id_counter: u32 = 1;
 
+        let ping_interval_ms = config.ping_interval_ms;
+
         loop {
             // Run the connection loop until disconnection
             let disconnect_reason = Self::run_single_connection(
@@ -167,6 +172,7 @@ impl Connection {
                 &resumable_streams,
                 &state_tx,
                 &mut request_id_counter,
+                ping_interval_ms,
             )
             .await;
 
@@ -345,12 +351,21 @@ impl Connection {
         resumable_streams: &ResumableStreamsMap,
         state_tx: &tokio::sync::watch::Sender<ConnectionState>,
         request_id_counter: &mut u32,
+        ping_interval_ms: u64,
     ) -> String {
         let codec = ClientCodec::Uncompressed;
         let mut encoder = codec.encoder();
         let mut decoder = codec.decoder();
 
         let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
+
+        let ping_interval = if ping_interval_ms > 0 {
+            ping_interval_ms
+        } else {
+            DEFAULT_PING_INTERVAL_MS
+        };
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -366,25 +381,25 @@ impl Connection {
                     match encoder.encode_mut(&pending_req.request) {
                         Ok(data) => {
                             if let Err(e) = ws_sink.send(Message::Binary(data.to_vec().into())).await {
-                                tracing::error!("Failed to send WebSocket message: {}", e);
+                                tracing::error!("Failed to send WebSocket message: {e}");
                                 let mut pending_map = pending_requests.write().await;
                                 if let Some(tx) = pending_map.remove(&request_id) {
                                     let _ = tx.send(Err(ResponseError {
                                         request_id,
                                         code: 0,
-                                        message: format!("Send failed: {}", e),
+                                        message: format!("Send failed: {e}"),
                                     }));
                                 }
                             }
                         }
                         Err(e) => {
-                            tracing::error!("Failed to encode request: {}", e);
+                            tracing::error!("Failed to encode request: {e}");
                             let mut pending_map = pending_requests.write().await;
                             if let Some(tx) = pending_map.remove(&request_id) {
                                 let _ = tx.send(Err(ResponseError {
                                     request_id,
                                     code: 0,
-                                    message: format!("Encode failed: {}", e),
+                                    message: format!("Encode failed: {e}"),
                                 }));
                             }
                         }
@@ -403,7 +418,7 @@ impl Connection {
                                     ).await;
                                 }
                                 Err(e) => {
-                                    tracing::error!("Failed to decode server message: {}", e);
+                                    tracing::error!("Failed to decode server message: {e}");
                                 }
                             }
                         }
@@ -411,7 +426,7 @@ impl Connection {
                             let reason = frame
                                 .map(|f| f.reason.to_string())
                                 .unwrap_or_else(|| "Server closed connection".to_string());
-                            tracing::warn!("WebSocket closed: {}", reason);
+                            tracing::warn!("WebSocket closed: {reason}");
                             let _ = state_tx.send(ConnectionState::Disconnected {
                                 reason: reason.clone(),
                             });
@@ -420,14 +435,17 @@ impl Connection {
                         Ok(Message::Ping(data)) => {
                             let _ = ws_sink.send(Message::Pong(data)).await;
                         }
+                        Ok(Message::Pong(_)) => {
+                            tracing::trace!("Received pong from server");
+                        }
                         Ok(_) => {}
                         Err(e) => {
-                            let reason = format!("WebSocket error: {}", e);
+                            let reason = format!("WebSocket error: {e}");
                             let error_str = e.to_string();
                             if error_str.contains("Connection reset without closing handshake") {
-                                tracing::info!("{}", reason);
+                                tracing::info!("{reason}");
                             } else {
-                                tracing::error!("{}", reason);
+                                tracing::error!("{reason}");
                             }
                             let _ = state_tx.send(ConnectionState::Disconnected {
                                 reason: reason.clone(),
@@ -435,6 +453,18 @@ impl Connection {
                             return reason;
                         }
                     }
+                }
+
+                _ = ping_timer.tick() => {
+                    if let Err(e) = ws_sink.send(Message::Ping(vec![].into())).await {
+                        let reason = format!("Failed to send ping: {e}");
+                        tracing::warn!("{reason}");
+                        let _ = state_tx.send(ConnectionState::Disconnected {
+                            reason: reason.clone(),
+                        });
+                        return reason;
+                    }
+                    tracing::trace!("Sent keepalive ping");
                 }
 
                 else => {

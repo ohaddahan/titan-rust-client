@@ -1,5 +1,7 @@
 //! Configuration for the Titan client.
 
+use crate::connection::DEFAULT_PING_INTERVAL_MS;
+
 #[derive(Debug, Clone)]
 pub struct TitanConfig {
     /// WebSocket URL (e.g., wss://api.titan.ag/api/v1/ws)
@@ -19,6 +21,9 @@ pub struct TitanConfig {
 
     /// Skip TLS certificate verification (default: false)
     pub danger_accept_invalid_certs: bool,
+
+    /// Interval in milliseconds for sending WebSocket ping frames to keep connection alive (default: 25000)
+    pub ping_interval_ms: u64,
 }
 
 impl TitanConfig {
@@ -30,6 +35,7 @@ impl TitanConfig {
             max_reconnect_attempts: None,
             auto_wrap_sol: false,
             danger_accept_invalid_certs: false,
+            ping_interval_ms: DEFAULT_PING_INTERVAL_MS,
         }
     }
 
@@ -52,6 +58,11 @@ impl TitanConfig {
         self.danger_accept_invalid_certs = accept;
         self
     }
+
+    pub fn with_ping_interval_ms(mut self, ms: u64) -> Self {
+        self.ping_interval_ms = ms;
+        self
+    }
 }
 
 impl Default for TitanConfig {
@@ -63,6 +74,7 @@ impl Default for TitanConfig {
             max_reconnect_attempts: None,
             auto_wrap_sol: false,
             danger_accept_invalid_certs: false,
+            ping_interval_ms: DEFAULT_PING_INTERVAL_MS,
         }
     }
 }
