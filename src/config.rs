@@ -1,29 +1,17 @@
 //! Configuration for the Titan client.
 
-use crate::connection::DEFAULT_PING_INTERVAL_MS;
+use crate::connection::{DEFAULT_PING_INTERVAL_MS, DEFAULT_PONG_TIMEOUT_MS};
 
 #[derive(Debug, Clone)]
 pub struct TitanConfig {
-    /// WebSocket URL (e.g., wss://api.titan.ag/api/v1/ws)
     pub url: String,
-
-    /// JWT token for authentication
     pub token: String,
-
-    /// Maximum reconnection delay in milliseconds (default: 30000)
     pub max_reconnect_delay_ms: u64,
-
-    /// Maximum reconnection attempts before giving up (default: unlimited/None)
     pub max_reconnect_attempts: Option<u32>,
-
-    /// Whether to wrap/unwrap SOL automatically (default: false)
     pub auto_wrap_sol: bool,
-
-    /// Skip TLS certificate verification (default: false)
     pub danger_accept_invalid_certs: bool,
-
-    /// Interval in milliseconds for sending WebSocket ping frames to keep connection alive (default: 25000)
     pub ping_interval_ms: u64,
+    pub pong_timeout_ms: u64,
 }
 
 impl TitanConfig {
@@ -36,6 +24,7 @@ impl TitanConfig {
             auto_wrap_sol: false,
             danger_accept_invalid_certs: false,
             ping_interval_ms: DEFAULT_PING_INTERVAL_MS,
+            pong_timeout_ms: DEFAULT_PONG_TIMEOUT_MS,
         }
     }
 
@@ -63,6 +52,11 @@ impl TitanConfig {
         self.ping_interval_ms = ms;
         self
     }
+
+    pub fn with_pong_timeout_ms(mut self, ms: u64) -> Self {
+        self.pong_timeout_ms = ms;
+        self
+    }
 }
 
 impl Default for TitanConfig {
@@ -75,6 +69,7 @@ impl Default for TitanConfig {
             auto_wrap_sol: false,
             danger_accept_invalid_certs: false,
             ping_interval_ms: DEFAULT_PING_INTERVAL_MS,
+            pong_timeout_ms: DEFAULT_PONG_TIMEOUT_MS,
         }
     }
 }

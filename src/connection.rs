@@ -31,6 +31,9 @@ pub const INITIAL_BACKOFF_MS: u64 = 100;
 /// Default ping interval in milliseconds (used if config value is 0).
 pub const DEFAULT_PING_INTERVAL_MS: u64 = 25_000;
 
+/// Default pong timeout in milliseconds — if no pong received within this window, reconnect.
+pub const DEFAULT_PONG_TIMEOUT_MS: u64 = 10_000;
+
 /// Information needed to resume a stream after reconnection.
 #[derive(Clone)]
 pub struct ResumableStream {
@@ -165,8 +168,6 @@ impl Connection {
         let mut reconnect_attempt: u32 = 0;
         let mut request_id_counter: u32 = 1;
 
-        let ping_interval_ms = config.ping_interval_ms;
-
         loop {
             // Run the connection loop until disconnection
             let disconnect_reason = Self::run_single_connection(
@@ -176,7 +177,7 @@ impl Connection {
                 &resumable_streams,
                 &state_tx,
                 &mut request_id_counter,
-                ping_interval_ms,
+                &config,
             )
             .await;
 
@@ -354,7 +355,7 @@ impl Connection {
         resumable_streams: &ResumableStreamsMap,
         state_tx: &tokio::sync::watch::Sender<ConnectionState>,
         request_id_counter: &mut u32,
-        ping_interval_ms: u64,
+        config: &TitanConfig,
     ) -> String {
         let codec = ClientCodec::Uncompressed;
         let mut encoder = codec.encoder();
@@ -362,13 +363,16 @@ impl Connection {
 
         let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
 
-        let ping_interval = if ping_interval_ms > 0 {
-            ping_interval_ms
+        let ping_interval_ms = if config.ping_interval_ms > 0 {
+            config.ping_interval_ms
         } else {
             DEFAULT_PING_INTERVAL_MS
         };
-        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval));
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
         ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let pong_timeout = Duration::from_millis(config.pong_timeout_ms);
+        let mut last_pong = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -437,6 +441,7 @@ impl Connection {
                             let _ = ws_sink.send(Message::Pong(data)).await;
                         }
                         Ok(Message::Pong(_)) => {
+                            last_pong = tokio::time::Instant::now();
                             tracing::trace!("Received pong from server");
                         }
                         Ok(_) => {}
@@ -457,6 +462,16 @@ impl Connection {
                 }
 
                 _ = ping_timer.tick() => {
+                    if config.pong_timeout_ms > 0 && last_pong.elapsed() > pong_timeout {
+                        let reason = "Pong timeout".to_string();
+                        let timeout_ms = config.pong_timeout_ms;
+                        tracing::warn!("No pong received within {timeout_ms}ms, triggering reconnect");
+                        let _ = state_tx.send(ConnectionState::Disconnected {
+                            reason: reason.clone(),
+                        });
+                        return reason;
+                    }
+
                     if let Err(e) = ws_sink.send(Message::Ping(vec![].into())).await {
                         let reason = format!("Failed to send ping: {e}");
                         tracing::warn!("{reason}");
