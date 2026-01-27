@@ -1,6 +1,7 @@
 //! Titan CLI test binary.
 //!
 //! Run with: cargo run --bin titan-cli --features cli -- --help
+#![expect(clippy::print_stderr)]
 
 #[cfg(not(feature = "cli"))]
 fn main() {
@@ -383,7 +384,7 @@ mod cli {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn cmd_swap(
         client: &TitanClient,
         rpc_url: &str,

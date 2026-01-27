@@ -188,8 +188,7 @@ impl StreamManager {
                             break;
                         }
                     }
-                    #[allow(unreachable_patterns)]
-                    _ => {
+                    StreamDataPayload::Other(_) => {
                         tracing::warn!("Received unexpected stream data payload type");
                     }
                 }

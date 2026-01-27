@@ -8,7 +8,7 @@ use std::time::Duration;
 use titan_rust_client::{ConnectionState, TitanClient, TitanConfig};
 
 /// Create a test config pointing to the mock server.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn test_config(url: &str) -> TitanConfig {
     TitanConfig {
         url: url.to_string(),
@@ -22,7 +22,7 @@ pub fn test_config(url: &str) -> TitanConfig {
 }
 
 /// Wait for a specific connection state with timeout.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub async fn wait_for_state(
     client: &TitanClient,
     expected: ConnectionState,
@@ -48,7 +48,7 @@ pub async fn wait_for_state(
                     return false;
                 }
             }
-            _ = tokio::time::sleep(remaining) => {
+            () = tokio::time::sleep(remaining) => {
                 return false;
             }
         }
@@ -56,7 +56,7 @@ pub async fn wait_for_state(
 }
 
 /// Initialize tracing for tests (call once per test module).
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("titan_rust_client=debug,test=debug")

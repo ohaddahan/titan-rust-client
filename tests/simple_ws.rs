@@ -2,6 +2,7 @@
 //!
 //! These tests validate the foundational WebSocket behavior that the
 //! Titan client relies on.
+#![expect(clippy::expect_used, clippy::unwrap_used)]
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;

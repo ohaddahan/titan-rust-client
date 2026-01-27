@@ -50,12 +50,12 @@ pub struct PendingRequest {
 
 /// Manages a WebSocket connection to the Titan API with auto-reconnect.
 pub struct Connection {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     config: TitanConfig,
     request_id: AtomicU32,
     sender: mpsc::Sender<PendingRequest>,
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pending_requests: PendingRequestsMap,
     resumable_streams: ResumableStreamsMap,
 }
@@ -130,7 +130,11 @@ impl Connection {
             "Sec-WebSocket-Protocol",
             titan_api_types::ws::v1::WEBSOCKET_SUBPROTO_BASE
                 .parse()
-                .unwrap(),
+                .map_err(|e| {
+                    TitanClientError::Unexpected(anyhow::anyhow!(
+                        "Sec-WebSocket-Protocol fail: {e}"
+                    ))
+                })?,
         );
 
         let (ws_stream, _response) = if config.danger_accept_invalid_certs {
@@ -202,7 +206,7 @@ impl Connection {
             // Calculate backoff delay with exponential increase
             let backoff_ms = calculate_backoff(reconnect_attempt, config.max_reconnect_delay_ms);
 
-            tracing::info!(
+            tracing::debug!(
                 attempt = reconnect_attempt,
                 backoff_ms,
                 "Reconnecting after disconnection: {}",
@@ -222,7 +226,7 @@ impl Connection {
                     ws_stream = new_stream;
                     reconnect_attempt = 0;
                     let _ = state_tx.send(ConnectionState::Connected);
-                    tracing::info!("Reconnected successfully");
+                    tracing::debug!("Reconnected successfully");
 
                     // Resume streams after reconnection
                     Self::resume_streams(
@@ -234,7 +238,6 @@ impl Connection {
                 }
                 Err(e) => {
                     tracing::warn!("Reconnection failed: {}", e);
-                    continue;
                 }
             }
         }
@@ -423,9 +426,7 @@ impl Connection {
                             }
                         }
                         Ok(Message::Close(frame)) => {
-                            let reason = frame
-                                .map(|f| f.reason.to_string())
-                                .unwrap_or_else(|| "Server closed connection".to_string());
+                            let reason = frame.map_or_else(|| "Server closed connection".to_string(), |f| f.reason.to_string());
                             tracing::warn!("WebSocket closed: {reason}");
                             let _ = state_tx.send(ConnectionState::Disconnected {
                                 reason: reason.clone(),
@@ -443,7 +444,7 @@ impl Connection {
                             let reason = format!("WebSocket error: {e}");
                             let error_str = e.to_string();
                             if error_str.contains("Connection reset without closing handshake") {
-                                tracing::info!("{reason}");
+                                tracing::debug!("{reason}");
                             } else {
                                 tracing::error!("{reason}");
                             }

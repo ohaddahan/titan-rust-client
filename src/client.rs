@@ -25,7 +25,7 @@ const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 10;
 pub struct TitanClient {
     connection: Arc<RwLock<Option<Arc<Connection>>>>,
     stream_manager: Arc<RwLock<Option<Arc<StreamManager>>>>,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     config: TitanConfig,
 }
 

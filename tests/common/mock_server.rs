@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Mock Titan WebSocket server for testing.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct MockTitanServer {
     addr: SocketAddr,
     shutdown_tx: broadcast::Sender<()>,
@@ -33,7 +33,6 @@ pub struct MockTitanServer {
 
 /// Configuration for the mock server.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct MockServerConfig {
     pub server_info: ServerInfo,
     pub venues: VenueInfo,
@@ -125,7 +124,7 @@ fn default_providers() -> Vec<ProviderInfo> {
     ]
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl MockTitanServer {
     /// Start a mock server on a random available port.
     pub async fn start() -> Self {
@@ -223,7 +222,7 @@ async fn run_server(
                         });
                     }
                     Err(e) => {
-                        eprintln!("Accept error: {}", e);
+                        tracing::error!("Accept error: {e}");
                     }
                 }
             }
@@ -398,13 +397,12 @@ async fn handle_request(
                 stream: None,
             }))
         }
-        #[allow(unreachable_patterns)]
-        _ => None,
+        RequestData::Other(_) => None,
     }
 }
 
 /// Generate mock SwapQuotes for testing.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn mock_swap_quotes(
     input_mint: Pubkey,
     output_mint: Pubkey,
@@ -422,12 +420,12 @@ pub fn mock_swap_quotes(
             steps: vec![],
             instructions: vec![],
             address_lookup_tables: vec![],
-            context_slot: Some(12345678),
-            time_taken_ns: Some(1000000),
+            context_slot: Some(12_345_678),
+            time_taken_ns: Some(1_000_000),
             expires_at_ms: None,
             expires_after_slot: None,
-            compute_units: Some(200000),
-            compute_units_safe: Some(300000),
+            compute_units: Some(200_000),
+            compute_units_safe: Some(300_000),
             transaction: None,
             reference_id: None,
         },
@@ -444,7 +442,7 @@ pub fn mock_swap_quotes(
 }
 
 /// Create mock stream data message.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn mock_stream_data(stream_id: u32, seq: u32, quotes: SwapQuotes) -> ServerMessage {
     ServerMessage::StreamData(StreamData {
         id: stream_id,

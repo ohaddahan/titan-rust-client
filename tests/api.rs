@@ -1,4 +1,5 @@
 //! One-shot API method tests.
+#![expect(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
 
