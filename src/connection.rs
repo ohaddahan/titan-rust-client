@@ -465,7 +465,7 @@ impl Connection {
                     if config.pong_timeout_ms > 0 && last_pong.elapsed() > pong_timeout {
                         let reason = "Pong timeout".to_string();
                         let timeout_ms = config.pong_timeout_ms;
-                        tracing::warn!("No pong received within {timeout_ms}ms, triggering reconnect");
+                        tracing::debug!("No pong received within {timeout_ms}ms, triggering reconnect");
                         let _ = state_tx.send(ConnectionState::Disconnected {
                             reason: reason.clone(),
                         });
