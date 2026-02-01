@@ -130,10 +130,6 @@ mod cli {
     }
 
     pub fn run() {
-        // Install the ring crypto provider (required for rustls 0.23+)
-        // Must be done before any TLS operations
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
         // Load .env file if present
         let _ = dotenvy::dotenv();
 

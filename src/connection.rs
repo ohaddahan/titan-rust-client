@@ -114,21 +114,16 @@ impl Connection {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::Connector;
 
-        // Build URL with auth token as query param
-        // Only add trailing slash if URL has no path (e.g., ws://host:port -> ws://host:port/)
         let url = if config.url.contains("/ws") || config.url.ends_with('/') {
-            // URL already has a path, just append query param
             format!("{}?auth={}", config.url, config.token)
         } else {
-            // URL has no path, add trailing slash first
             format!("{}/?auth={}", config.url, config.token)
         };
 
         let mut request = url.into_client_request().map_err(|e| {
-            TitanClientError::Unexpected(anyhow::anyhow!("Failed to build request: {}", e))
+            TitanClientError::Unexpected(anyhow::anyhow!("Failed to build request: {e}"))
         })?;
 
-        // Add the Titan subprotocol header
         request.headers_mut().insert(
             "Sec-WebSocket-Protocol",
             titan_api_types::ws::v1::WEBSOCKET_SUBPROTO_BASE
@@ -140,18 +135,17 @@ impl Connection {
                 })?,
         );
 
-        let (ws_stream, _response) = if config.danger_accept_invalid_certs {
-            let tls_config = crate::tls::build_dangerous_tls_config();
-            let connector = Connector::Rustls(Arc::new(tls_config));
+        let tls_config = if config.danger_accept_invalid_certs {
+            crate::tls::build_dangerous_tls_config()
+        } else {
+            crate::tls::build_default_tls_config()
+        }
+        .map_err(|e| TitanClientError::Unexpected(anyhow::anyhow!("TLS config failed: {e}")))?;
+        let connector = Connector::Rustls(Arc::new(tls_config));
+        let (ws_stream, _response) =
             tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
                 .await
-                .map_err(TitanClientError::WebSocket)?
-        } else {
-            tokio_tungstenite::connect_async(request)
-                .await
-                .map_err(TitanClientError::WebSocket)?
-        };
-
+                .map_err(TitanClientError::WebSocket)?;
         Ok(ws_stream)
     }
 
@@ -245,6 +239,7 @@ impl Connection {
 
         // Final cleanup
         Self::cleanup_pending_requests(&pending_requests).await;
+        Self::cleanup_resumable_streams(&resumable_streams).await;
     }
 
     /// Resume all active streams after reconnection.
@@ -535,6 +530,12 @@ impl Connection {
                 message: "Connection closed".to_string(),
             }));
         }
+    }
+
+    /// Drop all stream senders so `QuoteStream::recv()` returns `None` instead of hanging.
+    async fn cleanup_resumable_streams(resumable_streams: &ResumableStreamsMap) {
+        let mut streams = resumable_streams.write().await;
+        streams.clear();
     }
 
     /// Send a request and wait for response.

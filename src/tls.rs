@@ -1,17 +1,18 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
+static PROVIDER: LazyLock<Arc<rustls::crypto::CryptoProvider>> =
+    LazyLock::new(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+pub fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    PROVIDER.clone()
+}
+
 #[derive(Debug)]
 pub struct DangerousAcceptAllCertsVerifier(Arc<rustls::crypto::CryptoProvider>);
-
-impl DangerousAcceptAllCertsVerifier {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
-    }
-}
 
 impl ServerCertVerifier for DangerousAcceptAllCertsVerifier {
     fn verify_server_cert(
@@ -58,9 +59,24 @@ impl ServerCertVerifier for DangerousAcceptAllCertsVerifier {
     }
 }
 
-pub fn build_dangerous_tls_config() -> rustls::ClientConfig {
-    rustls::ClientConfig::builder()
+pub fn build_default_tls_config() -> Result<rustls::ClientConfig, TlsError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        root_store.add(cert).ok();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+pub fn build_dangerous_tls_config() -> Result<rustls::ClientConfig, TlsError> {
+    let provider = crypto_provider();
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?
         .dangerous()
-        .with_custom_certificate_verifier(DangerousAcceptAllCertsVerifier::new())
-        .with_no_client_auth()
+        .with_custom_certificate_verifier(Arc::new(DangerousAcceptAllCertsVerifier(provider)))
+        .with_no_client_auth();
+    Ok(config)
 }

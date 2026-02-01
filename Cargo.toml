@@ -1,6 +1,6 @@
 [package]
 name = "titan-rust-client"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Rust client for Titan Exchange WebSocket API"
 license = "MIT"
@@ -82,5 +82,6 @@ cargo-husky = { version = "1", default-features = false, features = [
   "run-cargo-fmt",
   "run-for-all",
 ] }
+dotenvy = "0.15"
 tokio-test = { version = "0.4" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
