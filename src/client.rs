@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use titan_api_types::ws::v1::{
     GetInfoRequest, GetVenuesRequest, ListProvidersRequest, ProviderInfo, RequestData,
-    ResponseData, ServerInfo, SwapPrice, SwapPriceRequest, SwapQuoteRequest, VenueInfo,
+    ResponseData, ServerInfo, SwapPrice, SwapPriceRequest, VenueInfo,
 };
 use tokio::sync::RwLock;
 
@@ -13,7 +13,6 @@ use crate::connection::Connection;
 use crate::error::TitanClientError;
 use crate::queue::StreamManager;
 use crate::state::ConnectionState;
-use crate::stream::QuoteStream;
 
 /// Default max concurrent streams if server doesn't specify.
 const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 10;
@@ -283,23 +282,5 @@ impl TitanClient {
                 std::mem::discriminant(&other)
             ))),
         }
-    }
-
-    // ========== Streaming API methods ==========
-
-    /// Start a new swap quote stream.
-    ///
-    /// Returns a `QuoteStream` that yields `SwapQuotes` updates.
-    /// The stream automatically sends `StopStream` when dropped.
-    ///
-    /// If the server's max concurrent streams limit is reached, the request
-    /// will be queued and started automatically when a slot becomes available.
-    #[tracing::instrument(skip_all)]
-    pub async fn new_swap_quote_stream(
-        &self,
-        request: SwapQuoteRequest,
-    ) -> Result<QuoteStream, TitanClientError> {
-        let manager = self.get_stream_manager().await?;
-        manager.request_stream(request).await
     }
 }
