@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Titan Rust Client — Code Map</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0f1117; color: #e1e4ea; display: flex; height: 100vh; overflow: hidden; }
+
+  .sidebar { width: 280px; min-width: 280px; background: #161820; border-right: 1px solid #2a2d38; display: flex; flex-direction: column; overflow-y: auto; }
+  .sidebar h2 { padding: 16px 16px 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #6b7280; }
+  .sidebar section { padding: 8px 16px 16px; border-bottom: 1px solid #2a2d38; }
+  .sidebar section:last-child { border-bottom: none; }
+
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; }
+  .preset-btn { background: #1e2130; border: 1px solid #3a3d4a; color: #c4c8d4; padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; transition: all .15s; }
+  .preset-btn:hover { background: #2a2d42; border-color: #5a5d6a; }
+  .preset-btn.active { background: #2563eb22; border-color: #3b82f6; color: #93bbfc; }
+
+  .layer-toggle { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; font-size: 13px; }
+  .layer-toggle input { display: none; }
+  .layer-swatch { width: 14px; height: 14px; border-radius: 3px; border: 2px solid transparent; transition: all .15s; }
+  .layer-toggle input:checked + .layer-swatch { border-color: #fff4; }
+  .layer-toggle input:not(:checked) + .layer-swatch { opacity: .35; }
+  .layer-toggle input:not(:checked) ~ span { opacity: .4; }
+
+  .conn-toggle { display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer; font-size: 12px; }
+  .conn-toggle input { display: none; }
+  .conn-line { width: 20px; height: 2px; border-radius: 1px; }
+  .conn-toggle input:not(:checked) + .conn-line { opacity: .25; }
+  .conn-toggle input:not(:checked) ~ span { opacity: .4; }
+
+  .comment-item { background: #1e2130; border: 1px solid #2a2d38; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px; font-size: 12px; position: relative; }
+  .comment-item .target { color: #93bbfc; font-weight: 600; font-size: 11px; }
+  .comment-item .file { color: #6b7280; font-size: 10px; font-family: monospace; }
+  .comment-item .text { margin-top: 4px; color: #c4c8d4; line-height: 1.4; }
+  .comment-item .del { position: absolute; top: 6px; right: 8px; background: none; border: none; color: #6b7280; cursor: pointer; font-size: 14px; line-height: 1; }
+  .comment-item .del:hover { color: #ef4444; }
+  .no-comments { color: #4b5060; font-size: 12px; font-style: italic; }
+
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  .toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: #161820; border-bottom: 1px solid #2a2d38; }
+  .toolbar button { background: #1e2130; border: 1px solid #3a3d4a; color: #c4c8d4; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .toolbar button:hover { background: #2a2d42; }
+  .zoom-label { font-size: 11px; color: #6b7280; margin-left: 4px; }
+  .toolbar .spacer { flex: 1; }
+  .toolbar .title { font-size: 14px; font-weight: 600; color: #e1e4ea; }
+
+  .canvas-wrap { flex: 1; position: relative; overflow: hidden; background: #12141c; }
+  .canvas-wrap svg { width: 100%; height: 100%; }
+
+  .legend { position: absolute; bottom: 12px; left: 12px; background: #161820ee; border: 1px solid #2a2d38; border-radius: 8px; padding: 10px 14px; font-size: 11px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+  .legend-line { width: 18px; height: 2px; border-radius: 1px; }
+
+  .prompt-area { background: #161820; border-top: 1px solid #2a2d38; padding: 12px 16px; max-height: 200px; overflow-y: auto; }
+  .prompt-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .prompt-header span { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: .5px; }
+  .copy-btn { background: #2563eb; border: none; color: #fff; padding: 5px 14px; border-radius: 5px; cursor: pointer; font-size: 12px; font-weight: 500; transition: all .15s; }
+  .copy-btn:hover { background: #3b82f6; }
+  .copy-btn.copied { background: #10b981; }
+  .prompt-text { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; color: #c4c8d4; line-height: 1.6; white-space: pre-wrap; min-height: 30px; }
+
+  .modal-overlay { display: none; position: fixed; inset: 0; background: #000a; z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay.show { display: flex; }
+  .modal { background: #1e2130; border: 1px solid #3a3d4a; border-radius: 10px; padding: 20px; width: 400px; max-width: 90vw; }
+  .modal h3 { font-size: 15px; margin-bottom: 2px; }
+  .modal .modal-file { font-family: monospace; font-size: 11px; color: #6b7280; margin-bottom: 12px; }
+  .modal textarea { width: 100%; height: 80px; background: #12141c; border: 1px solid #3a3d4a; border-radius: 6px; color: #e1e4ea; padding: 8px; font-family: system-ui; font-size: 13px; resize: vertical; }
+  .modal textarea:focus { outline: none; border-color: #3b82f6; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  .modal-actions button { padding: 6px 16px; border-radius: 6px; border: 1px solid #3a3d4a; background: #1e2130; color: #c4c8d4; cursor: pointer; font-size: 13px; }
+  .modal-actions .save { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .modal-actions .save:hover { background: #3b82f6; }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <h2>Views</h2>
+  <section><div class="presets" id="presets"></div></section>
+  <h2>Layers</h2>
+  <section id="layer-toggles"></section>
+  <h2>Connections</h2>
+  <section id="conn-toggles"></section>
+  <h2>Comments <span id="comment-count" style="color:#6b7280"></span></h2>
+  <section id="comments-list"><div class="no-comments">Click a node to add feedback</div></section>
+</div>
+
+<div class="main">
+  <div class="toolbar">
+    <span class="title">titan-rust-client</span>
+    <div class="spacer"></div>
+    <button onclick="zoomIn()">+</button>
+    <button onclick="zoomOut()">&minus;</button>
+    <button onclick="zoomReset()">Reset</button>
+    <span class="zoom-label" id="zoom-label">100%</span>
+  </div>
+  <div class="canvas-wrap" id="canvas-wrap">
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div class="legend" id="legend"></div>
+  </div>
+  <div class="prompt-area">
+    <div class="prompt-header">
+      <span>Generated Prompt</span>
+      <button class="copy-btn" id="copy-btn" onclick="copyPrompt()">Copy Prompt</button>
+    </div>
+    <div class="prompt-text" id="prompt-text">Adjust the view and click components to add feedback.</div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h3 id="modal-title"></h3>
+    <div class="modal-file" id="modal-file"></div>
+    <textarea id="modal-textarea" placeholder="Your feedback on this component..."></textarea>
+    <div class="modal-actions">
+      <button onclick="closeModal()">Cancel</button>
+      <button class="save" onclick="saveComment()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Data ──────────────────────────────────────────────
+
+const LAYERS = {
+  cli:        { label: 'CLI',                 color: '#fbbf24', fill: '#fbbf2418' },
+  client:     { label: 'Client API',          color: '#3b82f6', fill: '#3b82f618' },
+  stream:     { label: 'Stream Management',   color: '#10b981', fill: '#10b98118' },
+  connection: { label: 'Connection / WS',     color: '#8b5cf6', fill: '#8b5cf618' },
+  foundation: { label: 'Config & Foundation', color: '#f97316', fill: '#f9731618' },
+  solana:     { label: 'Solana Integration',  color: '#ec4899', fill: '#ec489918' },
+  external:   { label: 'External Crates',     color: '#6b7280', fill: '#6b728018' },
+};
+
+const CONN_TYPES = {
+  'data-flow':  { label: 'Data Flow',    color: '#3b82f6', dash: '' },
+  'ownership':  { label: 'Owns / Holds', color: '#10b981', dash: '6,3' },
+  'event':      { label: 'Async Event',  color: '#ef4444', dash: '4,4' },
+  'reexport':   { label: 'Re-export',    color: '#f97316', dash: '8,4' },
+  'dependency': { label: 'Dependency',   color: '#6b7280', dash: '2,3' },
+};
+
+const nodes = [
+  { id: 'cli',          label: 'titan-cli',             subtitle: 'src/bin/titan_cli.rs',  x: 520, y: 35,  w: 150, h: 42, layer: 'cli' },
+  { id: 'client',       label: 'TitanClient',           subtitle: 'src/client.rs',         x: 520, y: 130, w: 150, h: 42, layer: 'client' },
+  { id: 'lib',          label: 'lib.rs (re-exports)',    subtitle: 'src/lib.rs',            x: 280, y: 130, w: 155, h: 42, layer: 'client' },
+  { id: 'queue',        label: 'StreamManager',          subtitle: 'src/queue.rs',          x: 400, y: 240, w: 155, h: 42, layer: 'stream' },
+  { id: 'stream',       label: 'QuoteStream',            subtitle: 'src/stream.rs',         x: 640, y: 240, w: 145, h: 42, layer: 'stream' },
+  { id: 'connection',   label: 'Connection',             subtitle: 'src/connection.rs',     x: 400, y: 350, w: 155, h: 42, layer: 'connection' },
+  { id: 'resumable',    label: 'ResumableStream',        subtitle: 'src/connection.rs',     x: 640, y: 350, w: 160, h: 42, layer: 'connection' },
+  { id: 'config',       label: 'TitanConfig',            subtitle: 'src/config.rs',         x: 200, y: 460, w: 145, h: 42, layer: 'foundation' },
+  { id: 'error',        label: 'TitanClientError',       subtitle: 'src/error.rs',          x: 400, y: 460, w: 160, h: 42, layer: 'foundation' },
+  { id: 'state',        label: 'ConnectionState',        subtitle: 'src/state.rs',          x: 610, y: 460, w: 165, h: 42, layer: 'foundation' },
+  { id: 'tls',          label: 'TLS Config',             subtitle: 'src/tls.rs',            x: 820, y: 460, w: 130, h: 42, layer: 'foundation' },
+  { id: 'instructions', label: 'TitanInstructions',      subtitle: 'src/instructions.rs',   x: 820, y: 130, w: 170, h: 42, layer: 'solana' },
+  { id: 'api-types',    label: 'titan-api-types',        subtitle: 'crate',                 x: 130, y: 570, w: 155, h: 38, layer: 'external' },
+  { id: 'api-codec',    label: 'titan-api-codec',        subtitle: 'crate',                 x: 330, y: 570, w: 155, h: 38, layer: 'external' },
+  { id: 'tokio',        label: 'tokio',                  subtitle: 'async runtime',         x: 530, y: 570, w: 110, h: 38, layer: 'external' },
+  { id: 'tungstenite',  label: 'tokio-tungstenite',      subtitle: 'WebSocket',             x: 690, y: 570, w: 165, h: 38, layer: 'external' },
+  { id: 'solana-sdk',   label: 'solana-sdk',             subtitle: 'crate',                 x: 900, y: 570, w: 130, h: 38, layer: 'external' },
+];
+
+const connections = [
+  { from: 'cli', to: 'client', type: 'data-flow', label: 'creates & calls' },
+  { from: 'lib', to: 'client',  type: 'reexport', label: 're-exports' },
+  { from: 'lib', to: 'config',  type: 'reexport' },
+  { from: 'lib', to: 'error',   type: 'reexport' },
+  { from: 'lib', to: 'state',   type: 'reexport' },
+  { from: 'lib', to: 'stream',  type: 'reexport' },
+  { from: 'client', to: 'queue',      type: 'ownership', label: 'owns Arc' },
+  { from: 'client', to: 'connection', type: 'ownership', label: 'owns Arc' },
+  { from: 'client', to: 'config', type: 'data-flow', label: 'reads config' },
+  { from: 'client', to: 'error',  type: 'data-flow', label: 'returns errors' },
+  { from: 'client', to: 'state',  type: 'data-flow', label: 'watches state' },
+  { from: 'queue', to: 'connection', type: 'data-flow', label: 'sends requests' },
+  { from: 'queue', to: 'stream',     type: 'data-flow', label: 'creates QuoteStream' },
+  { from: 'queue', to: 'error',      type: 'data-flow' },
+  { from: 'stream', to: 'connection', type: 'data-flow', label: 'stop / unregister' },
+  { from: 'stream', to: 'queue',      type: 'event',     label: 'slot release (CAS)' },
+  { from: 'connection', to: 'resumable',  type: 'ownership', label: 'tracks streams' },
+  { from: 'connection', to: 'config',     type: 'data-flow', label: 'reconnect params' },
+  { from: 'connection', to: 'state',      type: 'event',     label: 'publishes state' },
+  { from: 'connection', to: 'error',      type: 'data-flow' },
+  { from: 'connection', to: 'tls',        type: 'data-flow', label: 'TLS handshake' },
+  { from: 'resumable', to: 'stream', type: 'event', label: 'on_end callback' },
+  { from: 'connection',  to: 'tungstenite', type: 'dependency' },
+  { from: 'connection',  to: 'api-codec',   type: 'dependency', label: 'encode/decode' },
+  { from: 'connection',  to: 'tokio',       type: 'dependency' },
+  { from: 'queue',       to: 'api-types',   type: 'dependency' },
+  { from: 'client',      to: 'api-types',   type: 'dependency' },
+  { from: 'tls',         to: 'tungstenite', type: 'dependency' },
+  { from: 'instructions', to: 'api-types',  type: 'dependency' },
+  { from: 'instructions', to: 'solana-sdk', type: 'dependency' },
+  { from: 'instructions', to: 'error',      type: 'data-flow' },
+  { from: 'cli',          to: 'instructions', type: 'data-flow', label: 'swap command' },
+];
+
+const PRESETS = {
+  'Full System':      { layers: ['cli','client','stream','connection','foundation','solana','external'], conns: ['data-flow','ownership','event','reexport','dependency'] },
+  'Core Flow':        { layers: ['client','stream','connection','foundation'], conns: ['data-flow','ownership','event'] },
+  'Stream Lifecycle': { layers: ['client','stream','connection'], conns: ['data-flow','ownership','event'] },
+  'Dependencies':     { layers: ['client','connection','foundation','external'], conns: ['dependency','data-flow'] },
+  'Solana Path':      { layers: ['cli','client','solana','foundation','external'], conns: ['data-flow','dependency'] },
+};
+
+// ── State ─────────────────────────────────────────────
+
+const state = {
+  layers: {}, conns: {}, comments: [],
+  zoom: 1, panX: 0, panY: 0,
+  activePreset: 'Full System', modalNode: null,
+};
+Object.keys(LAYERS).forEach(k => state.layers[k] = true);
+Object.keys(CONN_TYPES).forEach(k => state.conns[k] = true);
+
+const nodeMap = {};
+nodes.forEach(n => nodeMap[n.id] = n);
+
+// ── SVG helpers (all data is hardcoded, no user input in SVG) ─────
+
+const svgEl = document.getElementById('svg');
+const NS = 'http://www.w3.org/2000/svg';
+
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  if (attrs) Object.entries(attrs).forEach(([k,v]) => e.setAttribute(k, v));
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+function nodeCenter(n) { return { x: n.x + n.w / 2, y: n.y + n.h / 2 }; }
+
+function curvePath(from, to) {
+  const f = nodeCenter(from), t = nodeCenter(to);
+  const dy = t.y - f.y, dx = t.x - f.x;
+  if (Math.abs(dy) > Math.abs(dx) * 0.5) {
+    const cy = f.y + dy * 0.5;
+    return 'M' + f.x + ',' + f.y + ' C' + f.x + ',' + cy + ' ' + t.x + ',' + cy + ' ' + t.x + ',' + t.y;
+  }
+  const cx = f.x + dx * 0.5;
+  return 'M' + f.x + ',' + f.y + ' C' + cx + ',' + f.y + ' ' + cx + ',' + t.y + ' ' + t.x + ',' + t.y;
+}
+
+function render() {
+  while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+
+  const visNodes = nodes.filter(n => state.layers[n.layer]);
+  const visIds = new Set(visNodes.map(n => n.id));
+  const visConns = connections.filter(c => state.conns[c.type] && visIds.has(c.from) && visIds.has(c.to));
+  const commentTargets = new Set(state.comments.map(c => c.target));
+
+  // Defs (arrow markers)
+  const defs = el('defs', null, svgEl);
+  Object.entries(CONN_TYPES).forEach(([k, v]) => {
+    const m = el('marker', { id: 'arrow-' + k, markerWidth: '8', markerHeight: '6', refX: '7', refY: '3', orient: 'auto' }, defs);
+    el('polygon', { points: '0 0, 8 3, 0 6', fill: v.color }, m);
+  });
+
+  const panG = el('g', { id: 'pan-group', transform: 'translate(' + state.panX + ',' + state.panY + ') scale(' + state.zoom + ')' }, svgEl);
+
+  // Layer bands
+  const bands = [
+    { y: 15,  h: 65,  label: 'CLI',                 layer: 'cli' },
+    { y: 108, h: 72,  label: 'Client API',           layer: 'client' },
+    { y: 218, h: 72,  label: 'Stream Management',    layer: 'stream' },
+    { y: 328, h: 72,  label: 'Connection / WS',      layer: 'connection' },
+    { y: 438, h: 72,  label: 'Config & Foundation',   layer: 'foundation' },
+    { y: 548, h: 68,  label: 'External Crates',       layer: 'external' },
+  ];
+  bands.forEach(b => {
+    if (!state.layers[b.layer]) return;
+    const col = LAYERS[b.layer].color;
+    el('rect', { x: '60', y: String(b.y), width: '1020', height: String(b.h), rx: '6', fill: LAYERS[b.layer].fill, stroke: col + '22' }, panG);
+    const t = el('text', { x: '72', y: String(b.y + 16), 'font-size': '10', fill: col + '88', 'font-family': 'system-ui' }, panG);
+    t.textContent = b.label;
+  });
+
+  // Solana band
+  if (state.layers.solana) {
+    const col = LAYERS.solana.color;
+    el('rect', { x: '780', y: '108', width: '230', height: '72', rx: '6', fill: LAYERS.solana.fill, stroke: col + '22' }, panG);
+    const t = el('text', { x: '792', y: '124', 'font-size': '10', fill: col + '88', 'font-family': 'system-ui' }, panG);
+    t.textContent = 'Solana Integration';
+  }
+
+  // Connections
+  visConns.forEach(c => {
+    const from = nodeMap[c.from], to = nodeMap[c.to];
+    if (!from || !to) return;
+    const ct = CONN_TYPES[c.type];
+    const attrs = { d: curvePath(from, to), fill: 'none', stroke: ct.color, 'stroke-width': '1.5', 'stroke-opacity': '.55', 'marker-end': 'url(#arrow-' + c.type + ')' };
+    if (ct.dash) attrs['stroke-dasharray'] = ct.dash;
+    el('path', attrs, panG);
+    if (c.label) {
+      const f = nodeCenter(from), t = nodeCenter(to);
+      const txt = el('text', { x: String((f.x + t.x) / 2), y: String((f.y + t.y) / 2 - 5), 'font-size': '9', fill: ct.color + 'bb', 'text-anchor': 'middle', 'font-family': 'system-ui' }, panG);
+      txt.textContent = c.label;
+    }
+  });
+
+  // Nodes
+  visNodes.forEach(n => {
+    const lc = LAYERS[n.layer].color;
+    const hasComment = commentTargets.has(n.id);
+    const stroke = hasComment ? '#f59e0b' : lc;
+    const sw = hasComment ? '2.5' : '1.5';
+
+    const g = el('g', { 'data-id': n.id, style: 'cursor:pointer' }, panG);
+    g.classList.add('node');
+    el('rect', { x: String(n.x), y: String(n.y), width: String(n.w), height: String(n.h), rx: '8', fill: '#1a1d2a', stroke: stroke, 'stroke-width': sw }, g);
+
+    const title = el('text', { x: String(n.x + n.w / 2), y: String(n.y + 18), 'font-size': '12', 'font-weight': '600', fill: lc, 'text-anchor': 'middle', 'font-family': 'system-ui' }, g);
+    title.textContent = n.label;
+
+    const sub = el('text', { x: String(n.x + n.w / 2), y: String(n.y + 32), 'font-size': '9', fill: '#6b7280', 'text-anchor': 'middle', 'font-family': "'SF Mono',monospace" }, g);
+    sub.textContent = n.subtitle;
+
+    if (hasComment) {
+      const count = state.comments.filter(c => c.target === n.id).length;
+      el('circle', { cx: String(n.x + n.w - 6), cy: String(n.y + 6), r: '5', fill: '#f59e0b' }, g);
+      const badge = el('text', { x: String(n.x + n.w - 6), y: String(n.y + 9.5), 'font-size': '8', fill: '#000', 'text-anchor': 'middle', 'font-weight': '700', 'font-family': 'system-ui' }, g);
+      badge.textContent = String(count);
+    }
+
+    g.addEventListener('click', e => { e.stopPropagation(); openModal(n.id); });
+  });
+
+  updatePrompt();
+}
+
+// ── Zoom & Pan ────────────────────────────────────────
+
+let isDragging = false, dragStart = { x: 0, y: 0 }, panStart = { x: 0, y: 0 };
+
+function zoomIn()  { state.zoom = Math.min(state.zoom * 1.2, 3); updateZoom(); }
+function zoomOut() { state.zoom = Math.max(state.zoom / 1.2, 0.3); updateZoom(); }
+function zoomReset() { state.zoom = 1; state.panX = 0; state.panY = 0; updateZoom(); }
+function updateZoom() {
+  document.getElementById('zoom-label').textContent = Math.round(state.zoom * 100) + '%';
+  render();
+}
+
+const wrap = document.getElementById('canvas-wrap');
+wrap.addEventListener('mousedown', e => {
+  if (e.target.closest('.node')) return;
+  isDragging = true;
+  dragStart = { x: e.clientX, y: e.clientY };
+  panStart = { x: state.panX, y: state.panY };
+  wrap.style.cursor = 'grabbing';
+});
+window.addEventListener('mousemove', e => {
+  if (!isDragging) return;
+  state.panX = panStart.x + (e.clientX - dragStart.x);
+  state.panY = panStart.y + (e.clientY - dragStart.y);
+  const g = document.getElementById('pan-group');
+  if (g) g.setAttribute('transform', 'translate(' + state.panX + ',' + state.panY + ') scale(' + state.zoom + ')');
+});
+window.addEventListener('mouseup', () => { isDragging = false; wrap.style.cursor = ''; });
+wrap.addEventListener('wheel', e => {
+  e.preventDefault();
+  state.zoom = Math.max(0.3, Math.min(3, state.zoom * (e.deltaY > 0 ? 0.9 : 1.1)));
+  updateZoom();
+}, { passive: false });
+
+// ── Sidebar: DOM-based rendering ──────────────────────
+
+function buildPresets() {
+  const container = document.getElementById('presets');
+  while (container.firstChild) container.removeChild(container.firstChild);
+  Object.keys(PRESETS).forEach(name => {
+    const btn = document.createElement('button');
+    btn.className = 'preset-btn' + (state.activePreset === name ? ' active' : '');
+    btn.textContent = name;
+    btn.addEventListener('click', () => applyPreset(name));
+    container.appendChild(btn);
+  });
+}
+
+function applyPreset(name) {
+  const p = PRESETS[name];
+  if (!p) return;
+  state.activePreset = name;
+  Object.keys(LAYERS).forEach(k => state.layers[k] = p.layers.includes(k));
+  Object.keys(CONN_TYPES).forEach(k => state.conns[k] = p.conns.includes(k));
+  buildLayerToggles();
+  buildConnToggles();
+  buildPresets();
+  render();
+}
+
+function buildLayerToggles() {
+  const container = document.getElementById('layer-toggles');
+  while (container.firstChild) container.removeChild(container.firstChild);
+  Object.entries(LAYERS).forEach(([k, v]) => {
+    const label = document.createElement('label');
+    label.className = 'layer-toggle';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = state.layers[k];
+    input.addEventListener('change', () => {
+      state.layers[k] = input.checked;
+      state.activePreset = '';
+      buildPresets();
+      render();
+    });
+    const swatch = document.createElement('div');
+    swatch.className = 'layer-swatch';
+    swatch.style.background = v.color;
+    const span = document.createElement('span');
+    span.textContent = v.label;
+    label.appendChild(input);
+    label.appendChild(swatch);
+    label.appendChild(span);
+    container.appendChild(label);
+  });
+}
+
+function buildConnToggles() {
+  const container = document.getElementById('conn-toggles');
+  while (container.firstChild) container.removeChild(container.firstChild);
+  Object.entries(CONN_TYPES).forEach(([k, v]) => {
+    const label = document.createElement('label');
+    label.className = 'conn-toggle';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = state.conns[k];
+    input.addEventListener('change', () => {
+      state.conns[k] = input.checked;
+      state.activePreset = '';
+      buildPresets();
+      render();
+    });
+    const line = document.createElement('div');
+    line.className = 'conn-line';
+    line.style.background = v.color;
+    const span = document.createElement('span');
+    span.textContent = v.label;
+    label.appendChild(input);
+    label.appendChild(line);
+    label.appendChild(span);
+    container.appendChild(label);
+  });
+}
+
+function buildLegend() {
+  const container = document.getElementById('legend');
+  while (container.firstChild) container.removeChild(container.firstChild);
+  Object.entries(CONN_TYPES).forEach(([k, v]) => {
+    const item = document.createElement('div');
+    item.className = 'legend-item';
+    const line = document.createElement('div');
+    line.className = 'legend-line';
+    line.style.background = v.dash ? 'none' : v.color;
+    if (v.dash) line.style.borderTop = '2px dashed ' + v.color;
+    const span = document.createElement('span');
+    span.textContent = v.label;
+    item.appendChild(line);
+    item.appendChild(span);
+    container.appendChild(item);
+  });
+}
+
+// ── Comments (DOM-based, no innerHTML) ────────────────
+
+function openModal(nodeId) {
+  const n = nodeMap[nodeId];
+  if (!n) return;
+  state.modalNode = n;
+  document.getElementById('modal-title').textContent = n.label;
+  document.getElementById('modal-file').textContent = n.subtitle;
+  document.getElementById('modal-textarea').value = '';
+  document.getElementById('modal').classList.add('show');
+  setTimeout(() => document.getElementById('modal-textarea').focus(), 50);
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('show');
+  state.modalNode = null;
+}
+
+function saveComment() {
+  const text = document.getElementById('modal-textarea').value.trim();
+  if (!text || !state.modalNode) return;
+  state.comments.push({
+    id: Date.now(),
+    target: state.modalNode.id,
+    targetLabel: state.modalNode.label,
+    targetFile: state.modalNode.subtitle,
+    text: text,
+  });
+  closeModal();
+  renderComments();
+  render();
+}
+
+function renderComments() {
+  const container = document.getElementById('comments-list');
+  const countEl = document.getElementById('comment-count');
+  while (container.firstChild) container.removeChild(container.firstChild);
+
+  if (state.comments.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'no-comments';
+    empty.textContent = 'Click a node to add feedback';
+    container.appendChild(empty);
+    countEl.textContent = '';
+    return;
+  }
+  countEl.textContent = '(' + state.comments.length + ')';
+
+  state.comments.forEach(c => {
+    const item = document.createElement('div');
+    item.className = 'comment-item';
+
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = '\u00d7';
+    del.addEventListener('click', () => {
+      state.comments = state.comments.filter(x => x.id !== c.id);
+      renderComments();
+      render();
+    });
+
+    const target = document.createElement('div');
+    target.className = 'target';
+    target.textContent = c.targetLabel;
+
+    const file = document.createElement('div');
+    file.className = 'file';
+    file.textContent = c.targetFile;
+
+    const text = document.createElement('div');
+    text.className = 'text';
+    text.textContent = c.text;
+
+    item.appendChild(del);
+    item.appendChild(target);
+    item.appendChild(file);
+    item.appendChild(text);
+    container.appendChild(item);
+  });
+}
+
+// ── Prompt Generation ─────────────────────────────────
+
+function updatePrompt() {
+  const el = document.getElementById('prompt-text');
+  const visLayers = Object.entries(state.layers).filter(([,v]) => v).map(([k]) => LAYERS[k].label);
+  const parts = ['This is the titan-rust-client architecture (Rust WebSocket client for Titan Exchange).'];
+
+  if (visLayers.length < Object.keys(LAYERS).length) {
+    parts.push('Currently viewing: ' + visLayers.join(', ') + '.');
+  }
+
+  if (state.comments.length > 0) {
+    parts.push('');
+    parts.push('Feedback on specific components:');
+    state.comments.forEach(c => {
+      parts.push('');
+      parts.push('**' + c.targetLabel + '** (' + c.targetFile + '):');
+      parts.push(c.text);
+    });
+  } else {
+    parts.push('');
+    parts.push('Click components in the diagram to add feedback or questions.');
+  }
+  el.textContent = parts.join('\n');
+}
+
+function copyPrompt() {
+  const text = document.getElementById('prompt-text').textContent;
+  navigator.clipboard.writeText(text);
+  const btn = document.getElementById('copy-btn');
+  btn.textContent = 'Copied!';
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = 'Copy Prompt'; btn.classList.remove('copied'); }, 1500);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Enter' && document.getElementById('modal').classList.contains('show')) {
+    e.preventDefault();
+    saveComment();
+  }
+});
+
+// ── Init ──────────────────────────────────────────────
+
+buildPresets();
+buildLayerToggles();
+buildConnToggles();
+buildLegend();
+render();
+</script>
+</body>
+</html>

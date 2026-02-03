@@ -24,6 +24,7 @@ pub struct StreamManager {
     queue: Mutex<VecDeque<QueuedRequest>>,
     connection: Arc<Connection>,
     slot_available: Notify,
+    queue_worker_active: AtomicBool,
 }
 
 impl StreamManager {
@@ -35,6 +36,7 @@ impl StreamManager {
             queue: Mutex::new(VecDeque::new()),
             connection,
             slot_available: Notify::new(),
+            queue_worker_active: AtomicBool::new(false),
         })
     }
 
@@ -83,11 +85,17 @@ impl StreamManager {
             queue.push_back(QueuedRequest { request, result_tx });
         }
 
-        // Spawn task to process queue when slot becomes available
-        let manager = self.clone();
-        tokio::spawn(async move {
-            manager.process_queue().await;
-        });
+        // Spawn a single queue worker when transitioning from idle to active
+        if self
+            .queue_worker_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager.process_queue().await;
+            });
+        }
 
         // Wait for our turn
         result_rx.await.map_err(|_| {
@@ -120,7 +128,17 @@ impl StreamManager {
             };
 
             let Some(queued) = queued else {
-                // Queue empty, done
+                // Queue empty; mark worker idle and exit unless new work arrived
+                self.queue_worker_active.store(false, Ordering::SeqCst);
+                let has_work = !self.queue.lock().await.is_empty();
+                if has_work
+                    && self
+                        .queue_worker_active
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    continue;
+                }
                 break;
             };
 
@@ -183,11 +201,14 @@ impl StreamManager {
 
         // Shared atomic for the current server-side stream ID (updated on reconnect)
         let effective_stream_id = Arc::new(AtomicU32::new(stream_id));
+        let stopped_flag = Arc::new(AtomicBool::new(false));
 
         // Build the on_end callback for server-side cleanup paths
         let on_end_slot_released = slot_released.clone();
         let on_end_manager: Arc<Self> = self.clone();
+        let on_end_stopped = stopped_flag.clone();
         let on_end: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            on_end_stopped.store(true, Ordering::SeqCst);
             if on_end_slot_released
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
@@ -208,6 +229,7 @@ impl StreamManager {
                 raw_tx,
                 Some(on_end),
                 Some(effective_stream_id.clone()),
+                stopped_flag.clone(),
             )
             .await;
 
@@ -237,6 +259,7 @@ impl StreamManager {
             self.connection.clone(),
             Some(self.clone()),
             effective_stream_id,
+            stopped_flag,
             slot_released,
         ))
     }

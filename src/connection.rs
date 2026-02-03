@@ -1,7 +1,7 @@
 //! WebSocket connection management with auto-reconnect and stream resumption.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,8 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use titan_api_codec::codec::ws::v1::ClientCodec;
 use titan_api_codec::codec::Codec;
 use titan_api_types::ws::v1::{
-    ClientRequest, RequestData, ResponseError, ResponseSuccess, ServerMessage, StreamData,
-    SwapQuoteRequest,
+    ClientRequest, RequestData, ResponseSuccess, ServerMessage, StreamData, SwapQuoteRequest,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -22,7 +21,7 @@ use crate::error::TitanClientError;
 use crate::state::ConnectionState;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type ResponseResult = Result<ResponseSuccess, ResponseError>;
+type ResponseResult = Result<ResponseSuccess, TitanClientError>;
 type PendingRequestsMap = Arc<RwLock<HashMap<u32, oneshot::Sender<ResponseResult>>>>;
 type OnEndCallback = Arc<dyn Fn() + Send + Sync>;
 
@@ -46,6 +45,8 @@ pub struct ResumableStream {
     pub on_end: Option<OnEndCallback>,
     /// Shared atomic that tracks the current server-side stream ID (updated on reconnect remap).
     pub effective_id: Option<Arc<AtomicU32>>,
+    /// Shared flag indicating the stream has been stopped or dropped by the client.
+    pub stopped: Arc<AtomicBool>,
 }
 
 type ResumableStreamsMap = Arc<RwLock<HashMap<u32, ResumableStream>>>;
@@ -180,6 +181,9 @@ impl Connection {
             )
             .await;
 
+            // Fail all pending requests from this connection immediately
+            Self::fail_pending_requests(&pending_requests, &disconnect_reason).await;
+
             // Check if request channel is closed (client dropped)
             if request_rx.is_closed() {
                 tracing::info!("Request channel closed, shutting down connection");
@@ -231,6 +235,7 @@ impl Connection {
                     // Resume streams after reconnection
                     Self::resume_streams(
                         &mut ws_stream,
+                        &pending_requests,
                         &resumable_streams,
                         &mut request_id_counter,
                     )
@@ -250,6 +255,7 @@ impl Connection {
     /// Resume all active streams after reconnection.
     async fn resume_streams(
         ws_stream: &mut WsStream,
+        pending_requests: &PendingRequestsMap,
         resumable_streams: &ResumableStreamsMap,
         request_id_counter: &mut u32,
     ) {
@@ -272,6 +278,16 @@ impl Connection {
         let mut decoder = codec.decoder();
 
         for (old_stream_id, resumable) in streams_to_resume {
+            if resumable.stopped.load(Ordering::SeqCst) || resumable.sender.is_closed() {
+                let mut streams = resumable_streams.write().await;
+                if let Some(stream) = streams.remove(&old_stream_id) {
+                    if let Some(ref on_end) = stream.on_end {
+                        on_end();
+                    }
+                }
+                continue;
+            }
+
             let request_id = *request_id_counter;
             *request_id_counter += 1;
 
@@ -285,40 +301,92 @@ impl Connection {
                 Ok(data) => data.to_vec(),
                 Err(e) => {
                     tracing::error!("Failed to encode stream resume request: {}", e);
+                    let mut streams = resumable_streams.write().await;
+                    if let Some(stream) = streams.remove(&old_stream_id) {
+                        if let Some(ref on_end) = stream.on_end {
+                            on_end();
+                        }
+                    }
                     continue;
                 }
             };
 
             if let Err(e) = ws_stream.send(Message::Binary(encoded.into())).await {
                 tracing::error!("Failed to send stream resume request: {}", e);
+                let mut streams = resumable_streams.write().await;
+                if let Some(stream) = streams.remove(&old_stream_id) {
+                    if let Some(ref on_end) = stream.on_end {
+                        on_end();
+                    }
+                }
                 continue;
             }
 
-            // Wait for response to get new stream ID
-            match ws_stream.next().await {
-                Some(Ok(Message::Binary(data))) => {
-                    match decoder.decode_mut(data) {
+            // Wait for response to get new stream ID (skip interleaved frames)
+            loop {
+                match ws_stream.next().await {
+                    Some(Ok(Message::Binary(data))) => match decoder.decode_mut(data) {
                         Ok(ServerMessage::Response(response)) => {
+                            if response.request_id != request_id {
+                                Self::handle_server_message(
+                                    ServerMessage::Response(response),
+                                    pending_requests,
+                                    resumable_streams,
+                                )
+                                .await;
+                                continue;
+                            }
+
                             if let Some(stream_info) = response.stream {
                                 let new_stream_id = stream_info.id;
 
                                 // Update the stream mapping
                                 let mut streams = resumable_streams.write().await;
                                 if let Some(stream) = streams.remove(&old_stream_id) {
-                                    // Update the shared effective_id so QuoteStream uses the new ID
-                                    if let Some(ref effective_id) = stream.effective_id {
-                                        effective_id.store(new_stream_id, Ordering::SeqCst);
+                                    if stream.stopped.load(Ordering::SeqCst)
+                                        || stream.sender.is_closed()
+                                    {
+                                        if let Some(ref on_end) = stream.on_end {
+                                            on_end();
+                                        }
+                                    } else {
+                                        // Update the shared effective_id so QuoteStream uses the new ID
+                                        if let Some(ref effective_id) = stream.effective_id {
+                                            effective_id.store(new_stream_id, Ordering::SeqCst);
+                                        }
+                                        streams.insert(new_stream_id, stream);
+                                        tracing::info!(
+                                            old_id = old_stream_id,
+                                            new_id = new_stream_id,
+                                            "Stream resumed with new ID"
+                                        );
                                     }
-                                    streams.insert(new_stream_id, stream);
-                                    tracing::info!(
-                                        old_id = old_stream_id,
-                                        new_id = new_stream_id,
-                                        "Stream resumed with new ID"
-                                    );
+                                }
+                            } else {
+                                tracing::error!(
+                                    "Stream resume response missing stream info for {}",
+                                    old_stream_id
+                                );
+                                let mut streams = resumable_streams.write().await;
+                                if let Some(stream) = streams.remove(&old_stream_id) {
+                                    if let Some(ref on_end) = stream.on_end {
+                                        on_end();
+                                    }
                                 }
                             }
+                            break;
                         }
                         Ok(ServerMessage::Error(error)) => {
+                            if error.request_id != request_id {
+                                Self::handle_server_message(
+                                    ServerMessage::Error(error),
+                                    pending_requests,
+                                    resumable_streams,
+                                )
+                                .await;
+                                continue;
+                            }
+
                             tracing::error!(
                                 "Failed to resume stream {}: {}",
                                 old_stream_id,
@@ -331,25 +399,37 @@ impl Connection {
                                     on_end();
                                 }
                             }
+                            break;
                         }
-                        Ok(_) => {
-                            tracing::warn!("Unexpected response type during stream resumption");
+                        Ok(other) => {
+                            Self::handle_server_message(other, pending_requests, resumable_streams)
+                                .await;
                         }
                         Err(e) => {
                             tracing::error!("Failed to decode stream resume response: {}", e);
                         }
+                    },
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws_stream.send(Message::Pong(data)).await;
                     }
-                }
-                Some(Ok(_)) => {
-                    tracing::warn!("Unexpected message type during stream resumption");
-                }
-                Some(Err(e)) => {
-                    tracing::error!("WebSocket error during stream resumption: {}", e);
-                    break;
-                }
-                None => {
-                    tracing::error!("Connection closed during stream resumption");
-                    break;
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(frame))) => {
+                        let reason = frame.map_or_else(
+                            || "Server closed connection".to_string(),
+                            |f| f.reason.to_string(),
+                        );
+                        tracing::warn!("WebSocket closed during stream resumption: {reason}");
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        tracing::error!("WebSocket error during stream resumption: {}", e);
+                        break;
+                    }
+                    None => {
+                        tracing::error!("Connection closed during stream resumption");
+                        break;
+                    }
                 }
             }
         }
@@ -380,11 +460,16 @@ impl Connection {
         ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let pong_timeout = Duration::from_millis(config.pong_timeout_ms);
-        let mut last_pong = tokio::time::Instant::now();
+        let mut last_ping = tokio::time::Instant::now();
+        let mut awaiting_pong = false;
 
         loop {
             tokio::select! {
-                Some(pending_req) = request_rx.recv() => {
+                maybe_req = request_rx.recv() => {
+                    let Some(pending_req) = maybe_req else {
+                        return "Request channel closed".to_string();
+                    };
+
                     let request_id = pending_req.request.id;
                     *request_id_counter = request_id.max(*request_id_counter) + 1;
 
@@ -399,10 +484,8 @@ impl Connection {
                                 tracing::error!("Failed to send WebSocket message: {e}");
                                 let mut pending_map = pending_requests.write().await;
                                 if let Some(tx) = pending_map.remove(&request_id) {
-                                    let _ = tx.send(Err(ResponseError {
-                                        request_id,
-                                        code: 0,
-                                        message: format!("Send failed: {e}"),
+                                    let _ = tx.send(Err(TitanClientError::ConnectionClosed {
+                                        reason: format!("Send failed: {e}"),
                                     }));
                                 }
                             }
@@ -411,11 +494,9 @@ impl Connection {
                             tracing::error!("Failed to encode request: {e}");
                             let mut pending_map = pending_requests.write().await;
                             if let Some(tx) = pending_map.remove(&request_id) {
-                                let _ = tx.send(Err(ResponseError {
-                                    request_id,
-                                    code: 0,
-                                    message: format!("Encode failed: {e}"),
-                                }));
+                                let _ = tx.send(Err(TitanClientError::Unexpected(anyhow::anyhow!(
+                                    "Encode failed: {e}"
+                                ))));
                             }
                         }
                     }
@@ -449,7 +530,7 @@ impl Connection {
                             let _ = ws_sink.send(Message::Pong(data)).await;
                         }
                         Ok(Message::Pong(_)) => {
-                            last_pong = tokio::time::Instant::now();
+                            awaiting_pong = false;
                             tracing::trace!("Received pong from server");
                         }
                         Ok(_) => {}
@@ -470,7 +551,7 @@ impl Connection {
                 }
 
                 _ = ping_timer.tick() => {
-                    if config.pong_timeout_ms > 0 && last_pong.elapsed() > pong_timeout {
+                    if config.pong_timeout_ms > 0 && awaiting_pong && last_ping.elapsed() > pong_timeout {
                         let reason = "Pong timeout".to_string();
                         let timeout_ms = config.pong_timeout_ms;
                         tracing::debug!("No pong received within {timeout_ms}ms, triggering reconnect");
@@ -488,6 +569,8 @@ impl Connection {
                         });
                         return reason;
                     }
+                    awaiting_pong = true;
+                    last_ping = tokio::time::Instant::now();
                     tracing::trace!("Sent keepalive ping");
                 }
 
@@ -514,7 +597,10 @@ impl Connection {
             ServerMessage::Error(error) => {
                 let mut pending = pending_requests.write().await;
                 if let Some(tx) = pending.remove(&error.request_id) {
-                    let _ = tx.send(Err(error));
+                    let _ = tx.send(Err(TitanClientError::ServerError {
+                        code: error.code,
+                        message: error.message,
+                    }));
                 }
             }
             ServerMessage::StreamData(data) => {
@@ -539,12 +625,14 @@ impl Connection {
 
     /// Cleanup pending requests on final shutdown.
     async fn cleanup_pending_requests(pending_requests: &PendingRequestsMap) {
+        Self::fail_pending_requests(pending_requests, "Connection closed").await;
+    }
+
+    async fn fail_pending_requests(pending_requests: &PendingRequestsMap, reason: &str) {
         let mut pending_map = pending_requests.write().await;
-        for (request_id, tx) in pending_map.drain() {
-            let _ = tx.send(Err(ResponseError {
-                request_id,
-                code: 0,
-                message: "Connection closed".to_string(),
+        for (_request_id, tx) in pending_map.drain() {
+            let _ = tx.send(Err(TitanClientError::ConnectionClosed {
+                reason: reason.to_string(),
             }));
         }
     }
@@ -579,16 +667,17 @@ impl Connection {
                 response_tx,
             })
             .await
-            .map_err(|_| TitanClientError::Unexpected(anyhow::anyhow!("Connection closed")))?;
+            .map_err(|_| TitanClientError::ConnectionClosed {
+                reason: "Connection closed".to_string(),
+            })?;
 
-        let response = response_rx.await.map_err(|_| {
-            TitanClientError::Unexpected(anyhow::anyhow!("Response channel closed"))
-        })?;
+        let response = response_rx
+            .await
+            .map_err(|_| TitanClientError::ConnectionClosed {
+                reason: "Response channel closed".to_string(),
+            })?;
 
-        response.map_err(|e| TitanClientError::ServerError {
-            code: e.code,
-            message: e.message,
-        })
+        response
     }
 
     /// Register a resumable stream.
@@ -599,6 +688,7 @@ impl Connection {
         sender: mpsc::Sender<StreamData>,
         on_end: Option<OnEndCallback>,
         effective_id: Option<Arc<AtomicU32>>,
+        stopped: Arc<AtomicBool>,
     ) {
         let mut streams = self.resumable_streams.write().await;
         streams.insert(
@@ -608,6 +698,7 @@ impl Connection {
                 sender,
                 on_end,
                 effective_id,
+                stopped,
             },
         );
     }

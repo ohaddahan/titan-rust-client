@@ -15,6 +15,7 @@ use crate::queue::StreamManager;
 pub struct QuoteStream {
     stream_id: u32,
     effective_stream_id: Arc<AtomicU32>,
+    stopped_flag: Arc<AtomicBool>,
     slot_released: Arc<AtomicBool>,
     receiver: mpsc::Receiver<SwapQuotes>,
     connection: Arc<Connection>,
@@ -32,6 +33,7 @@ impl QuoteStream {
         Self {
             stream_id,
             effective_stream_id: Arc::new(AtomicU32::new(stream_id)),
+            stopped_flag: Arc::new(AtomicBool::new(false)),
             slot_released: Arc::new(AtomicBool::new(false)),
             receiver,
             connection,
@@ -47,11 +49,13 @@ impl QuoteStream {
         connection: Arc<Connection>,
         manager: Option<Arc<StreamManager>>,
         effective_stream_id: Arc<AtomicU32>,
+        stopped_flag: Arc<AtomicBool>,
         slot_released: Arc<AtomicBool>,
     ) -> Self {
         Self {
             stream_id,
             effective_stream_id,
+            stopped_flag,
             slot_released,
             receiver,
             connection,
@@ -86,19 +90,31 @@ impl QuoteStream {
             return Ok(());
         }
         self.stopped = true;
+        self.stopped_flag.store(true, Ordering::SeqCst);
 
-        let effective_id = self.effective_stream_id.load(Ordering::SeqCst);
+        let mut ids = Vec::with_capacity(3);
+        let first_id = self.effective_stream_id.load(Ordering::SeqCst);
+        ids.push(first_id);
 
-        // Send stop request first so server releases the stream before we free the slot
-        let _ = self
-            .connection
-            .send_request(RequestData::StopStream(StopStreamRequest {
-                id: effective_id,
-            }))
-            .await;
+        let second_id = self.effective_stream_id.load(Ordering::SeqCst);
+        if second_id != first_id {
+            ids.push(second_id);
+        }
 
-        // Unregister from connection
-        self.connection.unregister_stream(effective_id).await;
+        if self.stream_id != first_id && self.stream_id != second_id {
+            ids.push(self.stream_id);
+        }
+
+        for id in ids {
+            // Send stop request first so server releases the stream before we free the slot
+            let _ = self
+                .connection
+                .send_request(RequestData::StopStream(StopStreamRequest { id }))
+                .await;
+
+            // Unregister from connection
+            self.connection.unregister_stream(id).await;
+        }
 
         // CAS guard: only the first path to release the slot wins
         if self
@@ -118,31 +134,57 @@ impl QuoteStream {
 impl Drop for QuoteStream {
     fn drop(&mut self) {
         if !self.stopped {
-            let effective_id = self.effective_stream_id.load(Ordering::SeqCst);
+            self.stopped_flag.store(true, Ordering::SeqCst);
+
             let connection = self.connection.clone();
             let manager = self.manager.clone();
             let slot_released = self.slot_released.clone();
+            let effective_stream_id = self.effective_stream_id.clone();
+            let stream_id = self.stream_id;
 
-            tokio::spawn(async move {
-                // Send stop request first so server releases the stream
-                let _ = connection
-                    .send_request(RequestData::StopStream(StopStreamRequest {
-                        id: effective_id,
-                    }))
-                    .await;
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    let mut ids = Vec::with_capacity(3);
+                    let first_id = effective_stream_id.load(Ordering::SeqCst);
+                    ids.push(first_id);
 
-                connection.unregister_stream(effective_id).await;
+                    let second_id = effective_stream_id.load(Ordering::SeqCst);
 
-                // CAS guard: only the first path to release the slot wins
-                if slot_released
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    if let Some(ref manager) = manager {
-                        manager.stream_ended();
+                    if second_id != first_id {
+                        ids.push(second_id);
                     }
+
+                    if stream_id != first_id && stream_id != second_id {
+                        ids.push(stream_id);
+                    }
+
+                    for id in ids {
+                        // Send stop request first so server releases the stream
+                        let _ = connection
+                            .send_request(RequestData::StopStream(StopStreamRequest { id }))
+                            .await;
+
+                        connection.unregister_stream(id).await;
+                    }
+
+                    // CAS guard: only the first path to release the slot wins
+                    if slot_released
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        if let Some(ref manager) = manager {
+                            manager.stream_ended();
+                        }
+                    }
+                });
+            } else if slot_released
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                if let Some(ref manager) = manager {
+                    manager.stream_ended();
                 }
-            });
+            }
         }
     }
 }

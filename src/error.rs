@@ -16,6 +16,9 @@ pub enum TitanClientError {
     #[error("Connection failed after {attempts} attempts: {reason}")]
     ConnectionFailed { attempts: u32, reason: String },
 
+    #[error("Connection closed: {reason}")]
+    ConnectionClosed { reason: String },
+
     #[error("Server error {code}: {message}")]
     ServerError { code: u32, message: String },
 

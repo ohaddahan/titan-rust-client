@@ -9,10 +9,10 @@ use futures_util::{SinkExt, StreamExt};
 use titan_api_types::common::{BoundedValueWithDefault, Pubkey};
 use titan_api_types::ws::v1::{
     ClientRequest, ConnectionSettings, ProviderInfo, ProviderKind, QuoteSwapStreamResponse,
-    QuoteUpdateSettings, RequestData, ResponseData, ResponseSuccess, ServerInfo, ServerMessage,
-    ServerSettings, StopStreamResponse, StreamData, StreamDataPayload, StreamDataType, StreamStart,
-    SwapMode, SwapPrice, SwapQuotes, SwapRoute, SwapSettings, TransactionSettings, VenueInfo,
-    VersionInfo, WEBSOCKET_SUBPROTO_BASE,
+    QuoteUpdateSettings, RequestData, ResponseData, ResponseError, ResponseSuccess, ServerInfo,
+    ServerMessage, ServerSettings, StopStreamResponse, StreamData, StreamDataPayload,
+    StreamDataType, StreamStart, SwapMode, SwapPrice, SwapQuotes, SwapRoute, SwapSettings,
+    TransactionSettings, VenueInfo, VersionInfo, WEBSOCKET_SUBPROTO_BASE,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -39,7 +39,11 @@ pub struct MockServerConfig {
     pub providers: Vec<ProviderInfo>,
     pub max_concurrent_streams: u32,
     pub reject_auth: bool,
+    pub reject_new_stream: bool,
+    pub reject_new_stream_once: bool,
     pub disconnect_after_requests: Option<u32>,
+    pub interleave_on_new_stream: Vec<ServerMessage>,
+    pub interleave_on_new_stream_once: bool,
 }
 
 impl Default for MockServerConfig {
@@ -50,7 +54,11 @@ impl Default for MockServerConfig {
             providers: default_providers(),
             max_concurrent_streams: 10,
             reject_auth: false,
+            reject_new_stream: false,
+            reject_new_stream_once: false,
             disconnect_after_requests: None,
+            interleave_on_new_stream: Vec::new(),
+            interleave_on_new_stream_once: false,
         }
     }
 }
@@ -186,9 +194,23 @@ impl MockTitanServer {
         self.config.write().await.reject_auth = reject;
     }
 
+    /// Configure to reject new stream requests.
+    pub async fn set_reject_new_stream(&self, reject: bool, once: bool) {
+        let mut cfg = self.config.write().await;
+        cfg.reject_new_stream = reject;
+        cfg.reject_new_stream_once = once;
+    }
+
     /// Configure to disconnect after N requests (for reconnect testing).
     pub async fn set_disconnect_after(&self, count: Option<u32>) {
         self.config.write().await.disconnect_after_requests = count;
+    }
+
+    /// Configure interleaved messages to send before NewSwapQuoteStream responses.
+    pub async fn set_interleave_on_new_stream(&self, messages: Vec<ServerMessage>, once: bool) {
+        let mut cfg = self.config.write().await;
+        cfg.interleave_on_new_stream = messages;
+        cfg.interleave_on_new_stream_once = once;
     }
 
     /// Shutdown the server.
@@ -296,6 +318,27 @@ async fn handle_connection(
                             Err(_) => continue,
                         };
 
+                        let is_new_stream = matches!(request.data, RequestData::NewSwapQuoteStream(_));
+
+                        if is_new_stream && cfg.reject_new_stream {
+                            if cfg.reject_new_stream_once {
+                                let mut cfg = config.write().await;
+                                cfg.reject_new_stream = false;
+                            }
+
+                            let error = ServerMessage::Error(ResponseError {
+                                request_id: request.id,
+                                code: 400,
+                                message: "New stream rejected by mock server".to_string(),
+                            });
+
+                            let encoded = rmp_serde::to_vec_named(&error).unwrap();
+                            if ws_tx.send(Message::Binary(encoded.into())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+
                         // Handle the request
                         let response = handle_request(
                             request,
@@ -303,6 +346,27 @@ async fn handle_connection(
                             &stream_counter,
                             &active_streams,
                         ).await;
+
+                        if is_new_stream {
+                            let (interleaved, once) = {
+                                let cfg = config.read().await;
+                                (
+                                    cfg.interleave_on_new_stream.clone(),
+                                    cfg.interleave_on_new_stream_once,
+                                )
+                            };
+
+                            if !interleaved.is_empty() && once {
+                                config.write().await.interleave_on_new_stream.clear();
+                            }
+
+                            for msg in interleaved {
+                                let encoded = rmp_serde::to_vec_named(&msg).unwrap();
+                                if ws_tx.send(Message::Binary(encoded.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
 
                         // Encode and send response
                         if let Some(msg) = response {
