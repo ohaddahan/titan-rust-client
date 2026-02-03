@@ -17,18 +17,25 @@ There are two ways to get swap quotes:
 ## Architecture at a Glance
 
 ```
-┌─────────────┐
-│ TitanClient  │  ← Your entry point. Thread-safe, shareable via Arc.
-├─────────────┤
-│ StreamManager│  ← Enforces concurrency limits. Queues excess requests.
-├─────────────┤
-│ Connection   │  ← WebSocket I/O. Background task for read loop.
-│              │     Auto-reconnects with exponential backoff.
-│              │     Resumes streams after reconnect.
-├─────────────┤
-│ QuoteStream  │  ← Handle you hold. recv() for quotes, stop() when done.
-│              │     Drop impl cleans up automatically.
-└─────────────┘
+┌──────────────────┐
+│   TitanClient     │  ← Your entry point. Thread-safe, shareable via Arc.
+├──────────────────┤
+│   StreamManager   │  ← Enforces concurrency limits. Queues excess requests.
+├──────────────────┤
+│   Connection      │  ← WebSocket I/O. Background task for read loop.
+│                   │     Auto-reconnects with exponential backoff.
+│                   │     Resumes streams after reconnect.
+│                   │     Ping/pong keepalive for connection health.
+├──────────────────┤
+│   QuoteStream     │  ← Handle you hold. recv() for quotes, stop() when done.
+│                   │     Drop impl cleans up automatically.
+├──────────────────┤
+│ TitanInstructions │  ← Converts Titan routes → solana-sdk Instructions.
+│   (feature-gated) │     Fetches ALTs from chain for versioned transactions.
+├──────────────────┤
+│   TLS Layer       │  ← rustls-based. Secure (native certs) or dangerous
+│                   │     (accept-all verifier) for dev environments.
+└──────────────────┘
 ```
 
 **Data flow for streaming:**
@@ -100,6 +107,76 @@ pub async fn get_swap_price(&self, request: SwapQuoteRequest) -> Result<SwapQuot
 
 **Why `let _ = stream.stop()`:** If stop fails (connection already dead), we don't care — the `on_end` callback or Drop will handle it. The CAS guard ensures exactly one path releases the slot regardless.
 
+## The Solana Instruction Pipeline
+
+Once you have a `SwapRoute` from the streaming API, you need to turn it into something Solana understands. That's what `instructions.rs` handles (behind the `solana` feature gate).
+
+The pipeline:
+
+```
+SwapRoute (from Titan)
+  │
+  ├── route.address_lookup_tables  →  fetch from chain via RPC
+  │     (list of ALT pubkeys)         → deserialize into AddressLookupTableAccount
+  │
+  ├── route.instructions           →  convert Titan types → solana-sdk types
+  │     (Titan Instruction format)     (program_id, accounts, data mapping)
+  │
+  └── route.compute_units_safe     →  pass to ComputeBudgetInstruction
+        (recommended CU budget)
+```
+
+**Why this exists separately:** You might think "just serialize and send." But Solana versioned transactions need `AddressLookupTableAccount` objects (with the full address list, not just the pubkey). Those have to be fetched live from chain. And the Titan API types have their own `Pubkey`/`Instruction`/`AccountMeta` — they need converting to `solana-sdk` equivalents via the `.into()` conversions that `titan-api-types` provides with its feature flags.
+
+`TitanInstructions` is a stateless helper struct with static methods — it doesn't own any resources. You bring your own `RpcClient` and `SwapRoute`, it gives you back transaction-ready output.
+
+## The TLS Layer
+
+The `tls.rs` module provides two builders:
+
+1. **`build_default_tls_config()`** — Loads the system's native root certificates via `rustls-native-certs`, builds a standard `rustls::ClientConfig`. This is what you use in production.
+
+2. **`build_dangerous_tls_config()`** — Implements a `ServerCertVerifier` that accepts any certificate. Signature verification still happens (so TLS handshakes complete correctly), but server identity is not validated. Strictly for dev/test against local servers with self-signed certs.
+
+A `LazyLock<Arc<CryptoProvider>>` ensures the ring crypto provider is initialized exactly once, avoiding the "provider already installed" panic that can happen if multiple parts of your app try to set the default.
+
+## Connection State and Observability
+
+The client exposes its connection health through `ConnectionState`:
+
+```
+Connected ←──→ Reconnecting { attempt: N }
+    │                    │
+    └────────────────────┘
+              │
+              ▼
+    Disconnected { reason }
+```
+
+You can observe state changes via `client.state_receiver()`, which returns a `tokio::sync::watch::Receiver`. This is useful for health checks in axum handlers or for UI status indicators. The `wait_for_connected()` method blocks until the connection is established or fails permanently.
+
+## Ping/Pong Keepalive
+
+WebSocket connections can silently go stale — the server thinks you're connected, but packets are being dropped somewhere in between. The connection layer sends periodic WebSocket ping frames at `config.ping_interval_ms` intervals. If the server doesn't respond with a pong within `config.pong_timeout_ms`, the client treats the connection as dead and enters the reconnection loop.
+
+This is a common pattern in production WebSocket clients and catches a class of failures that TCP keepalive alone misses (especially behind load balancers and proxies that may hold connections open indefinitely).
+
+## The CLI Tool
+
+The `titan_cli.rs` binary (behind the `cli` feature) provides hands-on access to every API:
+
+| Command | What it does |
+|---------|-------------|
+| `info` | Fetch server info, protocol version, concurrent stream limits |
+| `venues` | List trading venues with program IDs |
+| `providers` | List liquidity providers with icons |
+| `price` | One-shot price check (simple request/response) |
+| `stream` | Open a live quote stream, print updates as they arrive |
+| `swap` | Full swap execution: stream quote → pick best → build tx → sign → send |
+| `watch` | Monitor connection state transitions in real-time |
+
+The CLI supports token shortcuts (`SOL`, `USDC`, `USDT`) and resolves them to mint addresses. The `swap` command can run interactively (asks for confirmation) or automated with `--yes`.
+
 ## Lessons Learned
 
 ### 1. The "Empty Quotes" Surprise
@@ -130,7 +207,23 @@ Each layer has a single responsibility. The `on_end` callback is the glue betwee
 
 ### 5. Why `thiserror` + `anyhow` Together
 
-`TitanClientError` uses `thiserror` for typed variants (Timeout, AuthenticationFailed, RateLimited) that callers can match on. The `Unexpected` variant wraps `anyhow::Error` for everything else. This is a practical pattern: structure what you can, bag the rest. Callers who need to handle specific errors match the typed variants; everything else bubbles up as an opaque error with context.
+`TitanClientError` uses `thiserror` for typed variants (Timeout, AuthenticationFailed, RateLimited, ConnectionFailed, ConnectionClosed, ServerError, WebSocket, Serialization, Deserialization) that callers can match on. The `Unexpected` variant wraps `anyhow::Error` for everything else. This is a practical pattern: structure what you can, bag the rest. Callers who need to handle specific errors match the typed variants; everything else bubbles up as an opaque error with context.
+
+### 6. Feature Gates and docs.rs Timeouts
+
+The Solana SDK dependencies are heavy — they pull in a massive dependency tree. Building them on docs.rs's constrained CI runners was timing out. The fix: make Solana optional via `[features] default = ["solana"]` and set `[package.metadata.docs.rs] default-features = false`. Users get Solana support by default, but docs.rs can build without it.
+
+The `instructions.rs` module is wrapped in `#[cfg(feature = "solana")]` in `lib.rs`. This is a clean pattern: the core streaming/querying functionality works without Solana at all.
+
+### 7. Connection Reliability is Harder Than It Looks
+
+PR #40 ("fix connection issues") revealed that a streaming feature wasn't working correctly and had to be removed. Real-world WebSocket connections fail in subtle ways: silent stale connections, reconnects that race with in-flight requests, stream IDs that change after reconnect. The ping/pong keepalive mechanism was added specifically because TCP keepalive alone doesn't catch all failure modes (especially behind cloud load balancers).
+
+The lesson: when building clients for stateful protocols (WebSocket streams with server-assigned IDs), the reconnection logic is often more complex than the happy-path code. Budget accordingly.
+
+### 8. LazyLock for Global Singletons
+
+The TLS module uses `LazyLock<Arc<CryptoProvider>>` to initialize the rustls crypto provider exactly once. This avoids a subtle bug: if you call `install_default()` from multiple threads or at multiple call sites, the second call panics. `LazyLock` guarantees one-time initialization with no runtime cost after the first access — cleaner than `Once` + `Option` or calling `install_default()` and ignoring the result.
 
 ## Technology Choices
 
@@ -140,4 +233,7 @@ Each layer has a single responsibility. The `on_end` callback is the glue betwee
 | `rmp-serde` (MessagePack) | Titan's wire protocol is MessagePack, not JSON. Binary format = smaller payloads, faster serialization. The `titan-api-codec` crate wraps this. |
 | `tracing` over `log` | Structured spans > flat log lines. `#[tracing::instrument(skip_all)]` on public methods gives you call-tree visibility without manually logging entry/exit. |
 | `rustls` over `native-tls` | Pure Rust TLS. No OpenSSL dependency, simpler cross-compilation. The `danger_accept_invalid_certs` option exists for dev/test environments. |
+| `rustls-native-certs` | Loads system root CA certificates so TLS works out of the box on any OS without bundling certs. |
 | No `async-trait` | Native `async fn` in traits landed in Rust 1.75. This crate uses native async throughout — no boxing overhead. |
+| `solana-sdk` v2.3 | Latest Solana SDK with versioned transactions and ALT support. Feature-gated so non-Solana users don't pay the compile cost. |
+| `cargo-husky` | Git pre-commit hooks that run `cargo test`, `cargo clippy`, and `cargo fmt` automatically. Catches issues before they reach CI. |

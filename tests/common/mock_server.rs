@@ -15,7 +15,7 @@ use titan_api_types::ws::v1::{
     TransactionSettings, VenueInfo, VersionInfo, WEBSOCKET_SUBPROTO_BASE,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
@@ -29,6 +29,8 @@ pub struct MockTitanServer {
     config: Arc<RwLock<MockServerConfig>>,
     stream_counter: Arc<AtomicU32>,
     connected_clients: Arc<AtomicU32>,
+    new_stream_requests: Arc<AtomicU32>,
+    new_stream_notify: Arc<Notify>,
 }
 
 /// Configuration for the mock server.
@@ -150,6 +152,8 @@ impl MockTitanServer {
         let config = Arc::new(RwLock::new(config));
         let stream_counter = Arc::new(AtomicU32::new(1));
         let connected_clients = Arc::new(AtomicU32::new(0));
+        let new_stream_requests = Arc::new(AtomicU32::new(0));
+        let new_stream_notify = Arc::new(Notify::new());
 
         let handle = tokio::spawn(run_server(
             listener,
@@ -157,6 +161,8 @@ impl MockTitanServer {
             config.clone(),
             stream_counter.clone(),
             connected_clients.clone(),
+            new_stream_requests.clone(),
+            new_stream_notify.clone(),
         ));
 
         Self {
@@ -166,6 +172,8 @@ impl MockTitanServer {
             config,
             stream_counter,
             connected_clients,
+            new_stream_requests,
+            new_stream_notify,
         }
     }
 
@@ -177,6 +185,28 @@ impl MockTitanServer {
     /// Get the number of connected clients.
     pub fn connected_clients(&self) -> u32 {
         self.connected_clients.load(Ordering::SeqCst)
+    }
+
+    /// Wait until at least `count` NewSwapQuoteStream requests have been observed.
+    pub async fn wait_for_new_stream_requests(
+        &self,
+        count: u32,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.new_stream_requests.load(Ordering::SeqCst) >= count {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            tokio::select! {
+                () = self.new_stream_notify.notified() => {}
+                () = tokio::time::sleep(remaining) => return false,
+            }
+        }
     }
 
     /// Update server configuration.
@@ -233,6 +263,8 @@ async fn run_server(
     config: Arc<RwLock<MockServerConfig>>,
     stream_counter: Arc<AtomicU32>,
     connected_clients: Arc<AtomicU32>,
+    new_stream_requests: Arc<AtomicU32>,
+    new_stream_notify: Arc<Notify>,
 ) {
     loop {
         tokio::select! {
@@ -243,10 +275,20 @@ async fn run_server(
                         let config = config.clone();
                         let stream_counter = stream_counter.clone();
                         let connected_clients = connected_clients.clone();
+                        let new_stream_requests = new_stream_requests.clone();
+                        let new_stream_notify = new_stream_notify.clone();
                         let shutdown_rx = shutdown_rx.resubscribe();
 
                         tokio::spawn(async move {
-                            handle_connection(stream, shutdown_rx, config, stream_counter).await;
+                            handle_connection(
+                                stream,
+                                shutdown_rx,
+                                config,
+                                stream_counter,
+                                new_stream_requests,
+                                new_stream_notify,
+                            )
+                            .await;
                             connected_clients.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
@@ -267,6 +309,8 @@ async fn handle_connection(
     mut shutdown_rx: broadcast::Receiver<()>,
     config: Arc<RwLock<MockServerConfig>>,
     stream_counter: Arc<AtomicU32>,
+    new_stream_requests: Arc<AtomicU32>,
+    new_stream_notify: Arc<Notify>,
 ) {
     // Custom callback to respond with the subprotocol
     let callback = |req: &Request,
@@ -326,6 +370,10 @@ async fn handle_connection(
                         };
 
                         let is_new_stream = matches!(request.data, RequestData::NewSwapQuoteStream(_));
+                        if is_new_stream {
+                            new_stream_requests.fetch_add(1, Ordering::SeqCst);
+                            new_stream_notify.notify_waiters();
+                        }
 
                         if is_new_stream && cfg.reject_new_stream {
                             if cfg.reject_new_stream_once {
@@ -479,7 +527,7 @@ async fn handle_request(
 }
 
 /// Generate mock SwapQuotes for testing.
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub fn mock_swap_quotes(
     input_mint: Pubkey,
     output_mint: Pubkey,
@@ -519,7 +567,7 @@ pub fn mock_swap_quotes(
 }
 
 /// Create mock stream data message.
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub fn mock_stream_data(stream_id: u32, seq: u32, quotes: SwapQuotes) -> ServerMessage {
     ServerMessage::StreamData(StreamData {
         id: stream_id,

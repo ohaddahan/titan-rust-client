@@ -362,19 +362,10 @@ async fn test_drop_during_resumption_race() {
     let _ = client.get_info().await;
     let _ = client.get_venues().await;
 
-    let mut receiver = client.state_receiver().await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let state = receiver.borrow_and_update().clone();
-            if !state.is_connected() {
-                break;
-            }
-            if receiver.changed().await.is_err() {
-                break;
-            }
-        }
-    })
-    .await;
+    let observed = server
+        .wait_for_new_stream_requests(2, Duration::from_secs(3))
+        .await;
+    assert!(observed, "Did not observe resume stream request");
 
     drop(stream);
 

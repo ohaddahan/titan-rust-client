@@ -21,10 +21,13 @@ Designed as both a publishable lib crate and includes a CLI binary for testing.
 cargo build
 cargo build --release
 
-# Run CLI
-cargo run --bin titan-cli -- --help
-cargo run --bin titan-cli -- info
-cargo run --bin titan-cli -- quote SOL USDC 1.0
+# Run CLI (requires --features cli)
+cargo run --features cli --bin titan-cli -- --help
+cargo run --features cli --bin titan-cli -- info
+cargo run --features cli --bin titan-cli -- price SOL USDC 1000000000
+cargo run --features cli --bin titan-cli -- stream SOL USDC 1000000000
+cargo run --features cli --bin titan-cli -- swap --keypair ~/.config/solana/id.json SOL USDC 100000000
+cargo run --features cli --bin titan-cli -- watch
 
 # Tests
 cargo test
@@ -39,7 +42,7 @@ cargo clippy --all-targets
 
 ### Core Components
 
-**TitanClient**: Main client struct, holds WebSocket connection and manages streams. Thread-safe (Arc internally) for sharing across axum handlers. Stores `TitanConfig` for runtime settings like `one_shot_timeout_ms`.
+**TitanClient**: Main client struct, holds WebSocket connection and manages streams. Thread-safe (Arc internally) for sharing across axum handlers. Stores `TitanConfig` for runtime settings like `one_shot_timeout_ms`, `ping_interval_ms`, `pong_timeout_ms`, and `danger_accept_invalid_certs`.
 
 **Connection Management**: Background tokio task reads WebSocket messages, dispatches to stream channels. Auto-reconnects with exponential backoff on disconnect.
 
@@ -49,22 +52,40 @@ cargo clippy --all-targets
 
 ### Key Files
 
-- `src/lib.rs` - Library entry point, re-exports
-- `src/client.rs` - TitanClient implementation (streaming + one-shot API)
-- `src/config.rs` - TitanConfig struct (includes `one_shot_timeout_ms`)
-- `src/connection.rs` - WebSocket connection management, stream resumption, `ResumableStream` with `on_end` callback
-- `src/error.rs` - TitanClientError enum (includes `Timeout` variant)
-- `src/state.rs` - Connection state observable
+- `src/lib.rs` - Library entry point, module declarations, type re-exports
+- `src/client.rs` - TitanClient implementation (streaming + one-shot + connection management API)
+- `src/config.rs` - TitanConfig struct with fluent builder (`one_shot_timeout_ms`, `ping_interval_ms`, `pong_timeout_ms`, `danger_accept_invalid_certs`, etc.)
+- `src/connection.rs` - WebSocket connection management, ping/pong keepalive, stream resumption, `ResumableStream` with `on_end` callback
+- `src/error.rs` - TitanClientError enum (Timeout, AuthenticationFailed, RateLimited, ConnectionFailed, ConnectionClosed, ServerError, WebSocket, Serialization, Deserialization, Unexpected)
+- `src/state.rs` - ConnectionState enum (Connected, Reconnecting, Disconnected) with observer pattern
 - `src/stream.rs` - QuoteStream handle with CAS slot guard
 - `src/queue.rs` - StreamManager concurrency limiter and request queue
-- `src/bin/titan-cli.rs` - CLI test binary
+- `src/instructions.rs` - Solana instruction conversion: Titan routes → `solana-sdk` Instructions + ALT fetching (feature-gated: `solana`)
+- `src/tls.rs` - TLS config builders: secure (native certs) + dangerous (accept-all verifier for dev)
+- `src/bin/titan_cli.rs` - CLI binary with subcommands: info, venues, providers, price, stream, swap, watch
 
 ## Configuration
 
 Environment variables for CLI:
 
-- `TITAN_URL` - WebSocket URL (default: wss://api.titan.ag/api/v1/ws)
-- `TITAN_TOKEN` - JWT authentication token
+- `TITAN_URL` - WebSocket URL (CLI default: `wss://us1.api.demo.titan.exchange/api/v1/ws`; library default: `wss://api.titan.ag/api/v1/ws`)
+- `TITAN_TOKEN` - JWT authentication token (required)
+- `SOLANA_RPC_URL` - Solana RPC endpoint (default: `https://api.mainnet-beta.solana.com`)
+- `TITAN_DANGER_ACCEPT_INVALID_CERTS` - Accept invalid TLS certs (dev only)
+
+### TitanConfig Fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `url` | `wss://api.titan.ag/api/v1/ws` | WebSocket URL |
+| `token` | (required) | JWT auth token |
+| `max_reconnect_delay_ms` | 30,000 | Max backoff ceiling |
+| `max_reconnect_attempts` | None (infinite) | Optional reconnect cap |
+| `auto_wrap_sol` | false | Auto-wrap SOL |
+| `danger_accept_invalid_certs` | false | Skip TLS cert verification (dev) |
+| `ping_interval_ms` | (from connection defaults) | WebSocket ping interval |
+| `pong_timeout_ms` | (from connection defaults) | Pong response timeout |
+| `one_shot_timeout_ms` | 10,000 | Timeout for `get_swap_price` |
 
 ## Public API
 
@@ -74,7 +95,27 @@ Environment variables for CLI:
 
 ### One-shot (no streaming)
 - `get_swap_price_simple(SwapPriceRequest) -> Result<SwapPrice>` — simple request/response, no stream overhead
-- `get_info()`, `get_venues()`, `list_providers()` — server metadata queries
+- `get_info() -> Result<ServerInfo>` — server info and connection limits
+- `get_venues() -> Result<VenueInfo>` — available trading venues
+- `list_providers() -> Result<Vec<ProviderInfo>>` — liquidity providers
+
+### Connection Management
+- `state() -> ConnectionState` — current connection state
+- `state_receiver() -> watch::Receiver<ConnectionState>` — connection state observable
+- `is_connected() -> bool` — quick connected check
+- `wait_for_connected() -> Result<()>` — blocks until connected (or fails permanently)
+- `close() -> Result<()>` — graceful shutdown: stops all streams, clears manager, closes WebSocket
+- `is_closed() -> bool` — whether client has been closed
+
+### Stream Introspection
+- `active_stream_count() -> u32` — number of active concurrent streams
+- `queued_stream_count() -> usize` — number of requests waiting for a free slot
+
+### Solana Instructions (feature: `solana`)
+- `TitanInstructions::prepare_instructions(route, rpc) -> Result<TitanInstructionsOutput>` — converts Titan route to solana-sdk Instructions + fetches ALTs
+- `TitanInstructions::fetch_address_lookup_tables(addresses, rpc)` — fetch ALT accounts from chain
+- `TitanInstructions::convert_instructions(instructions)` — batch convert Titan → solana-sdk instructions
+- `TitanInstructions::convert_instruction(instruction)` — single instruction conversion
 
 ### Known server behavior
 - The streaming endpoint may send initial `SwapQuotes` frames with empty `quotes` vector before real data arrives, especially with dummy user pubkeys. Tests should not assert `!quotes.quotes.is_empty()` unless using a real wallet address.
@@ -137,19 +178,39 @@ pub struct WorkerServiceState {
 - Re-export `titan-api-types` types directly (no wrapper types)
 - Enable Solana conversion features for seamless integration
 
+## Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `solana` | yes | Solana SDK integration (`instructions.rs`, type conversions) |
+| `cli` | no | CLI binary + deps (clap, dotenvy, tracing-subscriber, bs58, tokio-stream) |
+
+`docs.rs` builds with `default-features = false` to avoid Solana deps timeout.
+
 ## Dependencies
 
 ### Core
-- `titan-api-codec` - MessagePack encoding/decoding
-- `titan-api-types` - API type definitions
-- `tokio` - Async runtime
-- `tokio-tungstenite` - WebSocket client
-- `thiserror` / `anyhow` - Error handling
+- `titan-api-codec` (1.2.1) - MessagePack encoding/decoding with zstd/brotli/gzip compression
+- `titan-api-types` (2.0.0) - API type definitions with Solana conversion features
+- `tokio` - Async runtime (full features)
+- `tokio-tungstenite` (0.26) - WebSocket client with rustls-tls-native-roots
+- `rustls` (0.23) + `tokio-rustls` (0.26) + `rustls-native-certs` (0.8) - TLS stack
+- `futures-util` / `tokio-util` - Async utilities
+- `rmp-serde` / `serde` / `serde_json` / `bytes` - Serialization
+- `thiserror` (2) / `anyhow` (1) - Error handling
 - `tracing` - Observability
 
-### CLI
-- `clap` - Argument parsing
+### Solana (optional, feature-gated)
+- `solana-sdk` (2.3) - Transaction building
+- `solana-client` (2.3) - RPC client for ALT fetching
+- `solana-address-lookup-table-interface` (2.2.2) - ALT deserialization
+
+### CLI (optional, feature-gated)
+- `clap` (4) - Argument parsing
 - `dotenvy` - Environment variables
+- `bs58` - Base58 encoding
+- `tokio-stream` - Stream utilities
+- `tracing-subscriber` - Log output
 
 ## Further Reading
 

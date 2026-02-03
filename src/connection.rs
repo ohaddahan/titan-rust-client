@@ -792,10 +792,10 @@ impl Connection {
     /// Graceful shutdown: stop all streams and signal connection loop to exit.
     #[tracing::instrument(skip_all)]
     pub async fn shutdown(&self) {
-        self.shutdown.cancel();
-
         // Stop all streams first
         self.stop_all_streams().await;
+
+        self.shutdown.cancel();
 
         // Update state
         let _ = self.state_tx.send(ConnectionState::Disconnected {

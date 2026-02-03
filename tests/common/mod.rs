@@ -8,7 +8,7 @@ use std::time::Duration;
 use titan_rust_client::{ConnectionState, TitanClient, TitanConfig};
 
 /// Create a test config pointing to the mock server.
-#[expect(dead_code, reason = "used by some test targets but not all")]
+#[allow(dead_code)]
 pub fn test_config(url: &str) -> TitanConfig {
     TitanConfig {
         url: url.to_string(),
@@ -24,7 +24,7 @@ pub fn test_config(url: &str) -> TitanConfig {
 }
 
 /// Wait for a specific connection state with timeout.
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub async fn wait_for_state(
     client: &TitanClient,
     expected: ConnectionState,
