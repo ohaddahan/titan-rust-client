@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::TitanConfig;
 use crate::error::TitanClientError;
@@ -63,10 +64,22 @@ pub struct Connection {
     config: TitanConfig,
     request_id: AtomicU32,
     sender: mpsc::Sender<PendingRequest>,
+    shutdown: CancellationToken,
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
     #[expect(dead_code)]
     pending_requests: PendingRequestsMap,
     resumable_streams: ResumableStreamsMap,
+}
+
+struct RunSingleConnectionArgs<'a> {
+    ws_stream: &'a mut WsStream,
+    request_rx: &'a mut mpsc::Receiver<PendingRequest>,
+    pending_requests: &'a PendingRequestsMap,
+    resumable_streams: &'a ResumableStreamsMap,
+    state_tx: &'a tokio::sync::watch::Sender<ConnectionState>,
+    request_id_counter: &'a mut u32,
+    config: &'a TitanConfig,
+    shutdown: &'a CancellationToken,
 }
 
 impl Connection {
@@ -81,6 +94,7 @@ impl Connection {
 
         let pending_requests: PendingRequestsMap = Arc::new(RwLock::new(HashMap::new()));
         let resumable_streams: ResumableStreamsMap = Arc::new(RwLock::new(HashMap::new()));
+        let shutdown = CancellationToken::new();
 
         // Connect to WebSocket
         let ws_stream = Self::establish_connection(&config).await?;
@@ -101,6 +115,7 @@ impl Connection {
             streams_clone,
             state_tx_clone,
             config_clone,
+            shutdown.clone(),
         ));
 
         state_tx.send_replace(ConnectionState::Connected);
@@ -109,6 +124,7 @@ impl Connection {
             config,
             request_id: AtomicU32::new(1),
             sender,
+            shutdown,
             state_tx,
             pending_requests,
             resumable_streams,
@@ -163,6 +179,7 @@ impl Connection {
         resumable_streams: ResumableStreamsMap,
         state_tx: tokio::sync::watch::Sender<ConnectionState>,
         config: TitanConfig,
+        shutdown: CancellationToken,
     ) {
         let mut ws_stream = initial_ws_stream;
         let mut reconnect_attempt: u32 = 0;
@@ -170,19 +187,24 @@ impl Connection {
 
         loop {
             // Run the connection loop until disconnection
-            let disconnect_reason = Self::run_single_connection(
-                &mut ws_stream,
-                &mut request_rx,
-                &pending_requests,
-                &resumable_streams,
-                &state_tx,
-                &mut request_id_counter,
-                &config,
-            )
+            let disconnect_reason = Self::run_single_connection(RunSingleConnectionArgs {
+                ws_stream: &mut ws_stream,
+                request_rx: &mut request_rx,
+                pending_requests: &pending_requests,
+                resumable_streams: &resumable_streams,
+                state_tx: &state_tx,
+                request_id_counter: &mut request_id_counter,
+                config: &config,
+                shutdown: &shutdown,
+            })
             .await;
 
             // Fail all pending requests from this connection immediately
             Self::fail_pending_requests(&pending_requests, &disconnect_reason).await;
+
+            if shutdown.is_cancelled() {
+                break;
+            }
 
             // Check if request channel is closed (client dropped)
             if request_rx.is_closed() {
@@ -436,15 +458,17 @@ impl Connection {
     }
 
     /// Run a single connection until disconnection.
-    async fn run_single_connection(
-        ws_stream: &mut WsStream,
-        request_rx: &mut mpsc::Receiver<PendingRequest>,
-        pending_requests: &PendingRequestsMap,
-        resumable_streams: &ResumableStreamsMap,
-        state_tx: &tokio::sync::watch::Sender<ConnectionState>,
-        request_id_counter: &mut u32,
-        config: &TitanConfig,
-    ) -> String {
+    async fn run_single_connection(args: RunSingleConnectionArgs<'_>) -> String {
+        let RunSingleConnectionArgs {
+            ws_stream,
+            request_rx,
+            pending_requests,
+            resumable_streams,
+            state_tx,
+            request_id_counter,
+            config,
+            shutdown,
+        } = args;
         let codec = ClientCodec::Uncompressed;
         let mut encoder = codec.encoder();
         let mut decoder = codec.decoder();
@@ -465,6 +489,9 @@ impl Connection {
 
         loop {
             tokio::select! {
+                () = shutdown.cancelled() => {
+                    return "Client shutdown".to_string();
+                }
                 maybe_req = request_rx.recv() => {
                     let Some(pending_req) = maybe_req else {
                         return "Request channel closed".to_string();
@@ -653,6 +680,12 @@ impl Connection {
         &self,
         data: RequestData,
     ) -> Result<ResponseSuccess, TitanClientError> {
+        if self.shutdown.is_cancelled() {
+            return Err(TitanClientError::ConnectionClosed {
+                reason: "Client shutdown".to_string(),
+            });
+        }
+
         let request_id = self.request_id.fetch_add(1, Ordering::SeqCst);
         let request = ClientRequest {
             id: request_id,
@@ -759,6 +792,8 @@ impl Connection {
     /// Graceful shutdown: stop all streams and signal connection loop to exit.
     #[tracing::instrument(skip_all)]
     pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+
         // Stop all streams first
         self.stop_all_streams().await;
 

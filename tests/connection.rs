@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 use titan_api_types::common::Pubkey;
 use titan_api_types::ws::v1::{SwapMode, SwapParams, SwapQuoteRequest, TransactionParams};
@@ -301,6 +302,90 @@ async fn test_resumption_failure_releases_slot() {
     }
 
     let _ = stream.stop().await;
+    client.close().await.expect("Failed to close");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn test_drop_without_runtime_does_not_panic() {
+    init_tracing();
+
+    let server = MockTitanServer::start().await;
+    let client = TitanClient::new(test_config(&server.url()))
+        .await
+        .expect("Failed to connect");
+
+    let stream = client
+        .new_swap_quote_stream(make_quote_request(1_000_000))
+        .await
+        .expect("Failed to open stream");
+
+    let join = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(AssertUnwindSafe(|| drop(stream)))
+    });
+
+    let result = join.await.expect("drop thread panicked");
+    assert!(result.is_ok(), "Drop panicked without runtime");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while client.active_stream_count().await > 0 {
+        if Instant::now() >= deadline {
+            panic!("active_stream_count did not decrement after drop");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    client.close().await.expect("Failed to close");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn test_drop_during_resumption_race() {
+    init_tracing();
+
+    let server = MockTitanServer::start().await;
+    server.set_disconnect_after(Some(3)).await;
+
+    let client = TitanClient::new(test_config(&server.url()))
+        .await
+        .expect("Failed to connect");
+
+    let stream = client
+        .new_swap_quote_stream(make_quote_request(1_000_000))
+        .await
+        .expect("Failed to open stream");
+
+    assert_eq!(client.active_stream_count().await, 1);
+
+    server.set_new_stream_response_delay(Some(300)).await;
+
+    let _ = client.get_info().await;
+    let _ = client.get_venues().await;
+
+    let mut receiver = client.state_receiver().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let state = receiver.borrow_and_update().clone();
+            if !state.is_connected() {
+                break;
+            }
+            if receiver.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+
+    drop(stream);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.active_stream_count().await > 0 {
+        if Instant::now() >= deadline {
+            panic!("active_stream_count did not decrement after drop during resumption");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
     client.close().await.expect("Failed to close");
     server.stop().await;
 }

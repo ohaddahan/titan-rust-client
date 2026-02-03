@@ -41,6 +41,7 @@ pub struct MockServerConfig {
     pub reject_auth: bool,
     pub reject_new_stream: bool,
     pub reject_new_stream_once: bool,
+    pub delay_new_stream_response_ms: Option<u64>,
     pub disconnect_after_requests: Option<u32>,
     pub interleave_on_new_stream: Vec<ServerMessage>,
     pub interleave_on_new_stream_once: bool,
@@ -56,6 +57,7 @@ impl Default for MockServerConfig {
             reject_auth: false,
             reject_new_stream: false,
             reject_new_stream_once: false,
+            delay_new_stream_response_ms: None,
             disconnect_after_requests: None,
             interleave_on_new_stream: Vec::new(),
             interleave_on_new_stream_once: false,
@@ -199,6 +201,11 @@ impl MockTitanServer {
         let mut cfg = self.config.write().await;
         cfg.reject_new_stream = reject;
         cfg.reject_new_stream_once = once;
+    }
+
+    /// Configure a delay before responding to NewSwapQuoteStream.
+    pub async fn set_new_stream_response_delay(&self, delay_ms: Option<u64>) {
+        self.config.write().await.delay_new_stream_response_ms = delay_ms;
     }
 
     /// Configure to disconnect after N requests (for reconnect testing).
@@ -370,6 +377,12 @@ async fn handle_connection(
 
                         // Encode and send response
                         if let Some(msg) = response {
+                            if is_new_stream {
+                                if let Some(delay_ms) = cfg.delay_new_stream_response_ms {
+                                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                        .await;
+                                }
+                            }
                             let encoded = rmp_serde::to_vec_named(&msg).unwrap();
                             if ws_tx.send(Message::Binary(encoded.into())).await.is_err() {
                                 break;
