@@ -76,7 +76,7 @@ async fn test_list_providers() {
 }
 
 #[tokio::test]
-async fn test_get_swap_price() {
+async fn test_get_swap_price_simple() {
     init_tracing();
 
     let server = MockTitanServer::start().await;
@@ -93,7 +93,7 @@ async fn test_get_swap_price() {
     };
 
     let price = client
-        .get_swap_price(request)
+        .get_swap_price_simple(request)
         .await
         .expect("Failed to get swap price");
 

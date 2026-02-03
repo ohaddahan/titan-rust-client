@@ -1,7 +1,7 @@
 //! Stream queue management for concurrency limits.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use titan_api_types::ws::v1::{RequestData, StreamDataPayload, SwapQuoteRequest, SwapQuotes};
@@ -147,26 +147,54 @@ impl StreamManager {
         self: &Arc<Self>,
         request: SwapQuoteRequest,
     ) -> Result<QuoteStream, TitanClientError> {
+        // Pre-create the slot guard so cleanup paths can use it
+        let slot_released = Arc::new(AtomicBool::new(false));
+
         let response = self
             .connection
             .send_request(RequestData::NewSwapQuoteStream(request.clone()))
             .await
             .inspect_err(|_| {
-                // Release slot on error
-                self.active_count.fetch_sub(1, Ordering::SeqCst);
-                self.slot_available.notify_one();
+                // Release slot on error via CAS guard
+                if slot_released
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.active_count.fetch_sub(1, Ordering::SeqCst);
+                    self.slot_available.notify_one();
+                }
             })?;
 
         let stream_id = response
             .stream
             .ok_or_else(|| {
-                self.active_count.fetch_sub(1, Ordering::SeqCst);
-                self.slot_available.notify_one();
+                if slot_released
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.active_count.fetch_sub(1, Ordering::SeqCst);
+                    self.slot_available.notify_one();
+                }
                 TitanClientError::Unexpected(anyhow::anyhow!(
                     "NewSwapQuoteStream response missing stream info"
                 ))
             })?
             .id;
+
+        // Shared atomic for the current server-side stream ID (updated on reconnect)
+        let effective_stream_id = Arc::new(AtomicU32::new(stream_id));
+
+        // Build the on_end callback for server-side cleanup paths
+        let on_end_slot_released = slot_released.clone();
+        let on_end_manager: Arc<Self> = self.clone();
+        let on_end: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if on_end_slot_released
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                on_end_manager.stream_ended();
+            }
+        });
 
         // Create channels for stream data
         let (raw_tx, mut raw_rx) = mpsc::channel::<titan_api_types::ws::v1::StreamData>(32);
@@ -174,17 +202,25 @@ impl StreamManager {
 
         // Register the raw stream with the connection (includes request for resumption)
         self.connection
-            .register_stream(stream_id, request, raw_tx)
+            .register_stream(
+                stream_id,
+                request,
+                raw_tx,
+                Some(on_end),
+                Some(effective_stream_id.clone()),
+            )
             .await;
 
         // Spawn adapter task
         let adapter_connection = self.connection.clone();
+        let adapter_effective_id = effective_stream_id.clone();
         tokio::spawn(async move {
             while let Some(data) = raw_rx.recv().await {
                 match data.payload {
                     StreamDataPayload::SwapQuotes(quotes) => {
                         if quotes_tx.send(quotes).await.is_err() {
-                            adapter_connection.unregister_stream(stream_id).await;
+                            let eid = adapter_effective_id.load(Ordering::SeqCst);
+                            adapter_connection.unregister_stream(eid).await;
                             break;
                         }
                     }
@@ -200,6 +236,8 @@ impl StreamManager {
             quotes_rx,
             self.connection.clone(),
             Some(self.clone()),
+            effective_stream_id,
+            slot_released,
         ))
     }
 }

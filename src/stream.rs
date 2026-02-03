@@ -1,5 +1,6 @@
 //! Stream management and types.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use titan_api_types::ws::v1::{RequestData, StopStreamRequest, SwapQuotes};
@@ -13,6 +14,8 @@ use crate::queue::StreamManager;
 /// When dropped, automatically sends `StopStream` to the server.
 pub struct QuoteStream {
     stream_id: u32,
+    effective_stream_id: Arc<AtomicU32>,
+    slot_released: Arc<AtomicBool>,
     receiver: mpsc::Receiver<SwapQuotes>,
     connection: Arc<Connection>,
     manager: Option<Arc<StreamManager>>,
@@ -28,6 +31,8 @@ impl QuoteStream {
     ) -> Self {
         Self {
             stream_id,
+            effective_stream_id: Arc::new(AtomicU32::new(stream_id)),
+            slot_released: Arc::new(AtomicBool::new(false)),
             receiver,
             connection,
             manager: None,
@@ -41,9 +46,13 @@ impl QuoteStream {
         receiver: mpsc::Receiver<SwapQuotes>,
         connection: Arc<Connection>,
         manager: Option<Arc<StreamManager>>,
+        effective_stream_id: Arc<AtomicU32>,
+        slot_released: Arc<AtomicBool>,
     ) -> Self {
         Self {
             stream_id,
+            effective_stream_id,
+            slot_released,
             receiver,
             connection,
             manager,
@@ -51,9 +60,14 @@ impl QuoteStream {
         }
     }
 
-    /// Get the stream ID.
+    /// Get the original stream ID assigned at creation.
     pub fn stream_id(&self) -> u32 {
         self.stream_id
+    }
+
+    /// Get the current effective stream ID (may differ after reconnection).
+    pub fn effective_stream_id(&self) -> u32 {
+        self.effective_stream_id.load(Ordering::SeqCst)
     }
 
     /// Receive the next quote update.
@@ -73,21 +87,29 @@ impl QuoteStream {
         }
         self.stopped = true;
 
-        // Notify manager that slot is freed
-        if let Some(ref manager) = self.manager {
-            manager.stream_ended();
-        }
+        let effective_id = self.effective_stream_id.load(Ordering::SeqCst);
 
-        // Unregister from connection
-        self.connection.unregister_stream(self.stream_id).await;
-
-        // Send stop request (fire and forget - we don't care about the response)
+        // Send stop request first so server releases the stream before we free the slot
         let _ = self
             .connection
             .send_request(RequestData::StopStream(StopStreamRequest {
-                id: self.stream_id,
+                id: effective_id,
             }))
             .await;
+
+        // Unregister from connection
+        self.connection.unregister_stream(effective_id).await;
+
+        // CAS guard: only the first path to release the slot wins
+        if self
+            .slot_released
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            if let Some(ref manager) = self.manager {
+                manager.stream_ended();
+            }
+        }
 
         Ok(())
     }
@@ -96,21 +118,30 @@ impl QuoteStream {
 impl Drop for QuoteStream {
     fn drop(&mut self) {
         if !self.stopped {
-            let stream_id = self.stream_id;
+            let effective_id = self.effective_stream_id.load(Ordering::SeqCst);
             let connection = self.connection.clone();
             let manager = self.manager.clone();
+            let slot_released = self.slot_released.clone();
 
-            // Spawn a task to stop the stream
             tokio::spawn(async move {
-                // Notify manager that slot is freed
-                if let Some(ref manager) = manager {
-                    manager.stream_ended();
-                }
-
-                connection.unregister_stream(stream_id).await;
+                // Send stop request first so server releases the stream
                 let _ = connection
-                    .send_request(RequestData::StopStream(StopStreamRequest { id: stream_id }))
+                    .send_request(RequestData::StopStream(StopStreamRequest {
+                        id: effective_id,
+                    }))
                     .await;
+
+                connection.unregister_stream(effective_id).await;
+
+                // CAS guard: only the first path to release the slot wins
+                if slot_released
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    if let Some(ref manager) = manager {
+                        manager.stream_ended();
+                    }
+                }
             });
         }
     }

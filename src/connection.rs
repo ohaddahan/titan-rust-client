@@ -24,6 +24,7 @@ use crate::state::ConnectionState;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ResponseResult = Result<ResponseSuccess, ResponseError>;
 type PendingRequestsMap = Arc<RwLock<HashMap<u32, oneshot::Sender<ResponseResult>>>>;
+type OnEndCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// Initial backoff delay in milliseconds.
 pub const INITIAL_BACKOFF_MS: u64 = 100;
@@ -41,6 +42,10 @@ pub struct ResumableStream {
     pub request: SwapQuoteRequest,
     /// Channel to send stream data to.
     pub sender: mpsc::Sender<StreamData>,
+    /// Called when this stream ends (server-initiated or reconnect failure) to release the slot.
+    pub on_end: Option<OnEndCallback>,
+    /// Shared atomic that tracks the current server-side stream ID (updated on reconnect remap).
+    pub effective_id: Option<Arc<AtomicU32>>,
 }
 
 type ResumableStreamsMap = Arc<RwLock<HashMap<u32, ResumableStream>>>;
@@ -300,6 +305,10 @@ impl Connection {
                                 // Update the stream mapping
                                 let mut streams = resumable_streams.write().await;
                                 if let Some(stream) = streams.remove(&old_stream_id) {
+                                    // Update the shared effective_id so QuoteStream uses the new ID
+                                    if let Some(ref effective_id) = stream.effective_id {
+                                        effective_id.store(new_stream_id, Ordering::SeqCst);
+                                    }
                                     streams.insert(new_stream_id, stream);
                                     tracing::info!(
                                         old_id = old_stream_id,
@@ -315,9 +324,13 @@ impl Connection {
                                 old_stream_id,
                                 error.message
                             );
-                            // Remove the failed stream
+                            // Remove the failed stream and release its slot
                             let mut streams = resumable_streams.write().await;
-                            streams.remove(&old_stream_id);
+                            if let Some(stream) = streams.remove(&old_stream_id) {
+                                if let Some(ref on_end) = stream.on_end {
+                                    on_end();
+                                }
+                            }
                         }
                         Ok(_) => {
                             tracing::warn!("Unexpected response type during stream resumption");
@@ -512,7 +525,11 @@ impl Connection {
             }
             ServerMessage::StreamEnd(end) => {
                 let mut streams = resumable_streams.write().await;
-                streams.remove(&end.id);
+                if let Some(stream) = streams.remove(&end.id) {
+                    if let Some(ref on_end) = stream.on_end {
+                        on_end();
+                    }
+                }
             }
             ServerMessage::Other(_) => {
                 tracing::warn!("Received unknown server message type");
@@ -535,7 +552,11 @@ impl Connection {
     /// Drop all stream senders so `QuoteStream::recv()` returns `None` instead of hanging.
     async fn cleanup_resumable_streams(resumable_streams: &ResumableStreamsMap) {
         let mut streams = resumable_streams.write().await;
-        streams.clear();
+        for (_id, stream) in streams.drain() {
+            if let Some(ref on_end) = stream.on_end {
+                on_end();
+            }
+        }
     }
 
     /// Send a request and wait for response.
@@ -576,9 +597,19 @@ impl Connection {
         stream_id: u32,
         request: SwapQuoteRequest,
         sender: mpsc::Sender<StreamData>,
+        on_end: Option<OnEndCallback>,
+        effective_id: Option<Arc<AtomicU32>>,
     ) {
         let mut streams = self.resumable_streams.write().await;
-        streams.insert(stream_id, ResumableStream { request, sender });
+        streams.insert(
+            stream_id,
+            ResumableStream {
+                request,
+                sender,
+                on_end,
+                effective_id,
+            },
+        );
     }
 
     /// Unregister a stream.
@@ -625,9 +656,13 @@ impl Connection {
                 .await;
         }
 
-        // Clear all streams
+        // Clear all streams and call on_end for each
         let mut streams = self.resumable_streams.write().await;
-        streams.clear();
+        for (_id, stream) in streams.drain() {
+            if let Some(ref on_end) = stream.on_end {
+                on_end();
+            }
+        }
     }
 
     /// Graceful shutdown: stop all streams and signal connection loop to exit.

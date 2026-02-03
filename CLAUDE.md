@@ -39,21 +39,24 @@ cargo clippy --all-targets
 
 ### Core Components
 
-**TitanClient**: Main client struct, holds WebSocket connection and manages streams. Thread-safe (Arc internally) for sharing across axum handlers.
+**TitanClient**: Main client struct, holds WebSocket connection and manages streams. Thread-safe (Arc internally) for sharing across axum handlers. Stores `TitanConfig` for runtime settings like `one_shot_timeout_ms`.
 
 **Connection Management**: Background tokio task reads WebSocket messages, dispatches to stream channels. Auto-reconnects with exponential backoff on disconnect.
 
 **Stream Queue**: When `concurrentStreams` limit is reached, new stream requests queue internally and dispatch when slots free up.
 
+**Stream Slot Lifecycle**: Each stream occupies a concurrency slot tracked by `active_count` in `StreamManager`. A shared `Arc<AtomicBool>` (`slot_released`) guards each slot so that exactly one code path (user `stop()`/`Drop`, server `StreamEnd`, or reconnection failure) decrements the counter. The `on_end` callback in `ResumableStream` bridges the connection layer (which handles server-initiated endings) to the queue layer (which owns slot accounting). After reconnection, `effective_stream_id: Arc<AtomicU32>` is updated so that `QuoteStream` sends `StopStream` with the correct remapped ID.
+
 ### Key Files
 
 - `src/lib.rs` - Library entry point, re-exports
-- `src/client.rs` - TitanClient implementation
-- `src/config.rs` - TitanConfig struct
-- `src/connection.rs` - WebSocket connection management
-- `src/error.rs` - TitanClientError enum
+- `src/client.rs` - TitanClient implementation (streaming + one-shot API)
+- `src/config.rs` - TitanConfig struct (includes `one_shot_timeout_ms`)
+- `src/connection.rs` - WebSocket connection management, stream resumption, `ResumableStream` with `on_end` callback
+- `src/error.rs` - TitanClientError enum (includes `Timeout` variant)
 - `src/state.rs` - Connection state observable
-- `src/stream.rs` - Stream management and queue
+- `src/stream.rs` - QuoteStream handle with CAS slot guard
+- `src/queue.rs` - StreamManager concurrency limiter and request queue
 - `src/bin/titan-cli.rs` - CLI test binary
 
 ## Configuration
@@ -62,6 +65,19 @@ Environment variables for CLI:
 
 - `TITAN_URL` - WebSocket URL (default: wss://api.titan.ag/api/v1/ws)
 - `TITAN_TOKEN` - JWT authentication token
+
+## Public API
+
+### Streaming
+- `new_swap_quote_stream(SwapQuoteRequest) -> Result<QuoteStream>` — long-lived stream, caller controls recv/stop
+- `get_swap_price(SwapQuoteRequest) -> Result<SwapQuotes>` — one-shot wrapper: open stream → recv first quote → auto-stop. Uses `config.one_shot_timeout_ms` (default 10s).
+
+### One-shot (no streaming)
+- `get_swap_price_simple(SwapPriceRequest) -> Result<SwapPrice>` — simple request/response, no stream overhead
+- `get_info()`, `get_venues()`, `list_providers()` — server metadata queries
+
+### Known server behavior
+- The streaming endpoint may send initial `SwapQuotes` frames with empty `quotes` vector before real data arrives, especially with dummy user pubkeys. Tests should not assert `!quotes.quotes.is_empty()` unless using a real wallet address.
 
 ## Integration with worker-service
 
@@ -134,3 +150,7 @@ pub struct WorkerServiceState {
 ### CLI
 - `clap` - Argument parsing
 - `dotenvy` - Environment variables
+
+## Further Reading
+
+See `FOR_USER.md` for an in-depth narrative explanation of the architecture, design decisions, lessons learned, and pitfalls encountered during development.

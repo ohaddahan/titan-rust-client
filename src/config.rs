@@ -12,6 +12,7 @@ pub struct TitanConfig {
     pub danger_accept_invalid_certs: bool,
     pub ping_interval_ms: u64,
     pub pong_timeout_ms: u64,
+    pub one_shot_timeout_ms: u64,
 }
 
 impl TitanConfig {
@@ -25,6 +26,7 @@ impl TitanConfig {
             danger_accept_invalid_certs: false,
             ping_interval_ms: DEFAULT_PING_INTERVAL_MS,
             pong_timeout_ms: DEFAULT_PONG_TIMEOUT_MS,
+            one_shot_timeout_ms: 10_000,
         }
     }
 
@@ -57,6 +59,11 @@ impl TitanConfig {
         self.pong_timeout_ms = ms;
         self
     }
+
+    pub fn with_one_shot_timeout_ms(mut self, ms: u64) -> Self {
+        self.one_shot_timeout_ms = ms;
+        self
+    }
 }
 
 impl Default for TitanConfig {
@@ -70,6 +77,7 @@ impl Default for TitanConfig {
             danger_accept_invalid_certs: false,
             ping_interval_ms: DEFAULT_PING_INTERVAL_MS,
             pong_timeout_ms: DEFAULT_PONG_TIMEOUT_MS,
+            one_shot_timeout_ms: 10_000,
         }
     }
 }

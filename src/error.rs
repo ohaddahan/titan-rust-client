@@ -28,6 +28,9 @@ pub enum TitanClientError {
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] rmp_serde::decode::Error),
 
+    #[error("Operation timed out after {duration_ms}ms")]
+    Timeout { duration_ms: u64 },
+
     #[error(transparent)]
     Unexpected(#[from] anyhow::Error),
 }

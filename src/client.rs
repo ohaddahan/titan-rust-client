@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use titan_api_types::ws::v1::{
     GetInfoRequest, GetVenuesRequest, ListProvidersRequest, ProviderInfo, RequestData,
-    ResponseData, ServerInfo, SwapPrice, SwapPriceRequest, VenueInfo,
+    ResponseData, ServerInfo, SwapPrice, SwapPriceRequest, SwapQuoteRequest, SwapQuotes, VenueInfo,
 };
 use tokio::sync::RwLock;
 
@@ -24,7 +26,6 @@ const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 10;
 pub struct TitanClient {
     connection: Arc<RwLock<Option<Arc<Connection>>>>,
     stream_manager: Arc<RwLock<Option<Arc<StreamManager>>>>,
-    #[expect(dead_code)]
     config: TitanConfig,
 }
 
@@ -207,6 +208,54 @@ impl TitanClient {
         conn.is_none()
     }
 
+    // ========== Streaming API methods ==========
+
+    /// Open a new swap quote stream.
+    ///
+    /// Returns a `QuoteStream` handle that receives real-time quote updates.
+    /// Respects the server's concurrent stream limit; queues if at capacity.
+    #[tracing::instrument(skip_all)]
+    pub async fn new_swap_quote_stream(
+        &self,
+        request: SwapQuoteRequest,
+    ) -> Result<crate::stream::QuoteStream, TitanClientError> {
+        let manager = self.get_stream_manager().await?;
+        manager.request_stream(request).await
+    }
+
+    /// Get a one-shot swap quote by opening a stream, receiving the first quote, and closing.
+    ///
+    /// Uses `SwapQuoteRequest` inputs and returns full `SwapQuotes` with transaction instructions.
+    /// Respects `config.one_shot_timeout_ms` for the receive timeout.
+    #[tracing::instrument(skip_all)]
+    pub async fn get_swap_price(
+        &self,
+        request: SwapQuoteRequest,
+    ) -> Result<SwapQuotes, TitanClientError> {
+        let timeout_ms = self.config.one_shot_timeout_ms;
+        let timeout = Duration::from_millis(timeout_ms);
+
+        let mut stream = self.new_swap_quote_stream(request).await?;
+
+        let result = tokio::time::timeout(timeout, stream.recv()).await;
+
+        match result {
+            Ok(Some(quotes)) => {
+                let _ = stream.stop().await;
+                Ok(quotes)
+            }
+            Ok(None) => Err(TitanClientError::Unexpected(anyhow::anyhow!(
+                "Stream ended without sending quotes"
+            ))),
+            Err(_elapsed) => {
+                let _ = stream.stop().await;
+                Err(TitanClientError::Timeout {
+                    duration_ms: timeout_ms,
+                })
+            }
+        }
+    }
+
     // ========== One-shot API methods ==========
 
     /// Get server info and connection limits.
@@ -264,9 +313,9 @@ impl TitanClient {
         }
     }
 
-    /// Get a point-in-time swap price.
+    /// Get a point-in-time swap price (simple request/response, no streaming).
     #[tracing::instrument(skip_all)]
-    pub async fn get_swap_price(
+    pub async fn get_swap_price_simple(
         &self,
         request: SwapPriceRequest,
     ) -> Result<SwapPrice, TitanClientError> {

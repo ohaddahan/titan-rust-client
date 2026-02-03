@@ -22,14 +22,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-titan-rust-client = "0.1"
+titan-rust-client = "0.2"
 ```
 
 For the CLI binary:
 
 ```toml
 [dependencies]
-titan-rust-client = { version = "0.1", features = ["cli"] }
+titan-rust-client = { version = "0.2", features = ["cli"] }
 ```
 
 ## Quick Start
@@ -64,8 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let venues = client.get_venues().await?;
     println!("Available venues: {}", venues.labels.len());
 
-    // Get a price quote
-    let price = client.get_swap_price(SwapPriceRequest {
+    // Get a simple price check (request/response, no streaming)
+    let price = client.get_swap_price_simple(SwapPriceRequest {
         input_mint: sol_mint(),
         output_mint: usdc_mint(),
         amount: 1_000_000_000, // 1 SOL in lamports
@@ -73,6 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         exclude_dexes: None,
     }).await?;
     println!("1 SOL = {} USDC", price.amount_out as f64 / 1_000_000.0);
+
+    // Or get a full quote with transaction instructions (stream-based, auto-closes)
+    let quotes = client.get_swap_price(request.clone()).await?;
+    println!("Got {} quote routes", quotes.quotes.len());
 
     // Stream live quotes
     let request = SwapQuoteRequest {
@@ -229,8 +233,11 @@ titan-cli price So11111111111111111111111111111111111111112 EPjFWdd5AufqSSqeM2qN
 | `get_info()` | Get server info and settings |
 | `get_venues()` | Get available trading venues |
 | `list_providers()` | List liquidity providers |
-| `get_swap_price(request)` | Get instant swap price |
-| `new_swap_quote_stream(request)` | Start streaming quotes |
+| `get_swap_price(request)` | One-shot quote via stream (takes `SwapQuoteRequest`, returns `SwapQuotes`) |
+| `get_swap_price_simple(request)` | Simple price check (takes `SwapPriceRequest`, returns `SwapPrice`) |
+| `new_swap_quote_stream(request)` | Start streaming quotes (long-lived, caller controls recv/stop) |
+| `active_stream_count()` | Get number of active streams |
+| `queued_stream_count()` | Get number of queued stream requests |
 | `state_receiver()` | Get connection state observable |
 | `close()` | Gracefully disconnect |
 
