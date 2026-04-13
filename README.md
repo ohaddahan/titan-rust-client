@@ -207,9 +207,21 @@ titan-cli swap --keypair ~/.config/solana/id.json SOL USDC 100000000
 # Execute a swap (automated, no confirmation)
 titan-cli swap --keypair ~/.config/solana/id.json --yes SOL USDC 100000000
 
+# Execute a swap allowing multi-hop routes
+titan-cli swap --keypair ~/.config/solana/id.json --allow-multi-hop SOL USDC 100000000
+
+# Restrict routing to specific DEXes (repeat --dex)
+titan-cli swap --keypair ~/.config/solana/id.json --dex Raydium --dex Orca SOL USDC 100000000
+
 # Watch connection state
 titan-cli watch
 ```
+
+### Swap Routing Options
+
+The `swap` command supports routing controls:
+- `--dex <DEX>`: Restrict routing to specific DEX labels (repeat for multiple values).
+- `--allow-multi-hop`: Allow non-direct routes (default behavior is direct-only routes).
 
 ### Token Shortcuts
 

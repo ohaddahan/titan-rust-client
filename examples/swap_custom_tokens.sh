@@ -6,13 +6,19 @@
 #   2. Have a Solana keypair JSON file
 #
 # Usage:
-#   ./examples/swap_custom_tokens.sh <keypair> <input_mint> <output_mint> <amount>
+#   ./examples/swap_custom_tokens.sh <keypair> <input_mint> <output_mint> <amount> [swap_flags...]
 #
 # Example (swap BONK to SOL):
 #   ./examples/swap_custom_tokens.sh ~/.config/solana/id.json \
 #       DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263 \
 #       So11111111111111111111111111111111111111112 \
 #       1000000000000
+#
+# Example with routing controls:
+#   ./examples/swap_custom_tokens.sh ~/.config/solana/id.json \
+#       So11111111111111111111111111111111111111112 \
+#       EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
+#       1000000000 --allow-multi-hop --dex Raydium --dex Orca
 
 set -e
 
@@ -27,13 +33,14 @@ if [ -z "$TITAN_TOKEN" ]; then
     exit 1
 fi
 
-KEYPAIR_PATH="$1"
-INPUT_MINT="$2"
-OUTPUT_MINT="$3"
-AMOUNT="$4"
+KEYPAIR_PATH="/Users/ohaddahan/.config/solana/id.json"
+INPUT_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+OUTPUT_MINT="PreweJYECqtQwBtpxHL171nL2K6umo692gTm7Q3rpgF"
+AMOUNT="100"
+EXTRA_SWAP_ARGS=("${@:5}")
 
 if [ -z "$KEYPAIR_PATH" ] || [ -z "$INPUT_MINT" ] || [ -z "$OUTPUT_MINT" ] || [ -z "$AMOUNT" ]; then
-    echo "Usage: $0 <keypair_path> <input_mint> <output_mint> <amount>"
+    echo "Usage: $0 <keypair_path> <input_mint> <output_mint> <amount> [swap_flags...]"
     echo ""
     echo "Common token mints:"
     echo "  SOL/WSOL: So11111111111111111111111111111111111111112"
@@ -51,5 +58,7 @@ echo "  Amount:      $AMOUNT"
 
 cargo run --features cli --bin titan-cli -- swap \
     --keypair "$KEYPAIR_PATH" \
-    --slippage-bps 50 \
-    "$INPUT_MINT" "$OUTPUT_MINT" "$AMOUNT"
+    --slippage-bps 25 \
+    "${EXTRA_SWAP_ARGS[@]}" \
+    --dex "Meteora"
+#    "$INPUT_MINT" "$OUTPUT_MINT" "$AMOUNT"

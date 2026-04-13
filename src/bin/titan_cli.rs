@@ -120,6 +120,14 @@ mod cli {
             #[arg(long, default_value = "50")]
             slippage_bps: u16,
 
+            /// Restrict routing to specified DEX labels (repeat for multiple)
+            #[arg(long = "dex")]
+            dex: Vec<String>,
+
+            /// Allow non-direct routes (default is direct-only)
+            #[arg(long)]
+            allow_multi_hop: bool,
+
             /// Skip confirmation prompt
             #[arg(long)]
             yes: bool,
@@ -185,6 +193,8 @@ mod cli {
                 output_mint,
                 amount,
                 slippage_bps,
+                dex,
+                allow_multi_hop,
                 yes,
             } => {
                 cmd_swap(
@@ -195,6 +205,8 @@ mod cli {
                     &output_mint,
                     amount,
                     slippage_bps,
+                    dex,
+                    allow_multi_hop,
                     yes,
                 )
                 .await
@@ -280,7 +292,7 @@ mod cli {
             amount, input_mint, output_mint
         );
 
-        let price = client.get_swap_price(request).await?;
+        let price = client.get_swap_price_simple(request).await?;
         println!("\nSwap Price:");
         println!("  In Amount: {}", price.amount_in);
         println!("  Out Amount: {}", price.amount_out);
@@ -389,6 +401,8 @@ mod cli {
         output_mint: &str,
         amount: u64,
         slippage_bps: u16,
+        dexes: Vec<String>,
+        allow_multi_hop: bool,
         skip_confirm: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use solana_client::nonblocking::rpc_client::RpcClient;
@@ -412,6 +426,8 @@ mod cli {
         // Create RPC client
         let rpc_client =
             RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
+        let dexes = (!dexes.is_empty()).then_some(dexes);
+        let only_direct_routes = !allow_multi_hop;
 
         // Create quote request with our pubkey
         let request = SwapQuoteRequest {
@@ -420,9 +436,9 @@ mod cli {
                 output_mint: output,
                 amount,
                 swap_mode: None,
-                only_direct_routes: Some(true),
+                only_direct_routes: Some(only_direct_routes),
                 slippage_bps: Some(slippage_bps),
-                dexes: None,
+                dexes,
                 exclude_dexes: None,
                 add_size_constraint: None,
                 size_constraint: None,
